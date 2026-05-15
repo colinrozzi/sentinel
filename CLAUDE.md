@@ -102,6 +102,36 @@ Exports (theater calls these on you):
 
 For phase 1 specifically: `handle-child-event` accumulates the chain, `handle-child-error` and `handle-child-exit` are the crash hooks. `handle-child-external-stop` should not respawn — it means "we asked for this, leave it stopped".
 
+## Gotchas
+
+### `supervisor.spawn` does NOT auto-call `actor.init`
+
+When you call `supervisor.spawn(manifest, None, None)`, theater creates the actor instance but does **not** invoke its `theater:simple/actor.init` export. The child sits there idle, never crashes, never sends chain events — and the supervisor loses its signal.
+
+You must follow every successful `supervisor.spawn` with an explicit RPC into the child:
+
+```rust
+let init_params = Value::Tuple(alloc::vec![Value::String(String::new())]);
+let _ = rpc_call(
+    child_id.clone(),
+    String::from("theater:simple/actor.init"),
+    init_params,
+    Value::Tuple(alloc::vec![]),
+);
+```
+
+The sentinel routes both initial spawn and crash-respawn through a `spawn_and_init` helper to keep this in one place. Anywhere you add a new spawn site, use that helper or reproduce the rpc-call pattern.
+
+This bit us during the inbox migration in march 2026 (same surface area in `inbox/acceptor`), and again during the sentinel phase 1 rollout — pinning it here so the next agent doesn't rediscover it.
+
+(If theater's spawn semantics change later, revisit this note.)
+
+### Inbox HTTPS responses close without TLS `close_notify`
+
+The inbox server terminates connections by closing the TCP socket without sending a TLS `close_notify` alert; rustls (in theater's wasm-tcp + tls-upgrade path) is strict and surfaces this as a `recv` error on the next read. The HTTP POST itself succeeds — the email lands — but our `tcp_receive` returns an error before we can read the status line.
+
+The sentinel handles this by treating a recv error as EOF and logging `inbox: response unreadable; assuming delivered ...` when we get no status back. Don't take that log line as a real failure unless emails actually stop showing up at the dev's mailbox.
+
 ## Development process
 
 ### Version control
