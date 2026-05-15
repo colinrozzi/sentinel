@@ -58,6 +58,7 @@
           installPhaseCommand = ''
             mkdir -p $out
             cp target/wasm32-unknown-unknown/release/sentinel.wasm $out/
+            cp target/wasm32-unknown-unknown/release/crashing_child.wasm $out/
           '';
         });
 

@@ -4,15 +4,14 @@ Supervisor + crash-notification + (eventually) HTTPS-triggered deploy for theate
 
 Runs as the top-level process for an actor system: it spawns the configured child manifest, watches it, and on crash collects the child's chain, emails it to the corresponding dev agent's mailbox, and respawns. Eventually a small HTTPS endpoint accepts authenticated deploy prompts from GitHub Actions to fetch + swap binaries.
 
-## Status: phase 0 — skeleton only
+## Status: phase 1 — crash → email → respawn
 
 What works:
 - Spawns a configured child manifest on init
-- Logs lifecycle events (`handle-child-event`, `handle-child-error`, `handle-child-exit`, `handle-child-external-stop`)
-
-What's coming in phase 1:
-- Accumulate the child's chain in memory via `handle-child-event`
-- On error / exit-with-error: serialize the chain, email it to the configured dev address via the inbox API, respawn the child
+- Accumulates child chain events into an in-memory ring buffer (cap 500, oldest dropped past cap)
+- On `handle-child-error` / `handle-child-exit`: emails the configured dev address via the inbox HTTP API with the chain snapshot, then respawns the child
+- `handle-child-external-stop` does **not** respawn (intentional shutdown)
+- Crash-loop rate limiter: at most 5 restarts per 60s; past that, the sentinel logs and stops respawning (operator must restart the sentinel to unblock)
 
 What's coming in phase 2:
 - HTTPS endpoint (bearer-token auth) that accepts deploy prompts
@@ -20,9 +19,9 @@ What's coming in phase 2:
 - Verify checksum, swap the child manifest's `package` path atomically, restart child via supervisor
 
 Phase 3+:
-- Per-child rate limiting on respawn (currently unbounded restart-loops are possible)
-- Crash-chain truncation rules (chains can grow large)
 - Status query endpoint (current child id, uptime, last crash, etc.)
+- Configurable rate-limit / chain-cap (currently hard-coded)
+- Attachment-based chain delivery once the inbox supports it (today the chain ships inline in the email body)
 
 ## Run locally
 
@@ -44,6 +43,24 @@ nix build .#theater -o result-theater
 ```
 
 State persists across restarts via `theater:simple/store` at `./.store/sentinel/` (repo-local).
+
+## Demo / test: deliberately-crashing child
+
+`tests/crashing-child/` ships a minimal actor that calls `runtime.shutdown(Some(bytes))` in its init, so the supervising sentinel sees a `handle-child-exit` with a non-empty result and runs the crash flow.
+
+```sh
+nix build .#default
+# point sentinel-actor/manifest.toml's initial_state at:
+#   {
+#     "child_manifest": "/abs/path/to/sentinel/tests/crashing-child/manifest.toml",
+#     "dev_email": "sentinel-dev@colinrozzi.com",
+#     "inbox_api": "mail.colinrozzi.com:443",
+#     "inbox_token": "<token>"
+#   }
+./result-theater/bin/theater start sentinel-actor/manifest.toml
+```
+
+The child crashes immediately on init; expect to see a crash email land in `dev_email`'s mailbox, then a respawn. After 5 crashes within 60s the rate limiter trips and the child stays dead.
 
 ## Architecture
 
