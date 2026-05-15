@@ -188,6 +188,26 @@ theater.url = "github:colinrozzi/theater/release-20260512";
 
 Run `nix flake update theater` before `nix build` if you're relying on a recent theater PR — the lock can drift behind the branch tip.
 
+## Tickets
+
+Some of your work arrives as tickets at /home/colin/work/actors/tickets/, in addition to email. Notification emails from `tickets@colinrozzi.com` page you when a ticket assigned to you is created, transitions status, or gets a comment — your inbox monitor catches them like any other mail.
+
+The CLI is at `/home/colin/work/actors/tickets/cli/tickets`:
+
+```sh
+# at session start, alongside your inbox check:
+/home/colin/work/actors/tickets/cli/tickets list --assignee sentinel-dev@colinrozzi.com --status open
+
+# read / comment / transition:
+/home/colin/work/actors/tickets/cli/tickets show <id>
+/home/colin/work/actors/tickets/cli/tickets comment <id> --author sentinel-dev@colinrozzi.com --body B
+/home/colin/work/actors/tickets/cli/tickets status <id> <open|in-progress|done|closed>
+```
+
+Comment on a ticket when the content lives forever attached to that ticket (decisions, blockers, acknowledgements). Email when the conversation is cross-cutting or fuzzy. When in doubt, comment.
+
+Full intro: `/home/colin/work/actors/tickets/AGENT-ONBOARDING.md`.
+
 ## Working autonomously
 
 When responding to a request:
