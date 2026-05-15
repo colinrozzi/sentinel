@@ -1,0 +1,6 @@
+name = "crashing-child"
+version = "0.1.0"
+package = "/home/colin/work/actors/sentinel/target/wasm32-unknown-unknown/release/crashing_child.wasm"
+
+[[handler]]
+type = "runtime"
