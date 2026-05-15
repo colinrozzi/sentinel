@@ -1,0 +1,28 @@
+name = "sentinel"
+version = "0.1.0"
+package = "/home/colin/work/actors/sentinel/target/wasm32-unknown-unknown/release/sentinel.wasm"
+# initial_state is a JSON blob (replace at deploy time):
+#   {
+#     "child_manifest": "/abs/path/to/child/manifest.toml",
+#     "dev_email": "inbox-dev@colinrozzi.com",
+#     "inbox_api": "mail.colinrozzi.com:443",
+#     "inbox_token": "<bearer token>"
+#   }
+initial_state = "{}"
+
+[[handler]]
+type = "runtime"
+
+[[handler]]
+type = "supervisor"
+
+[[handler]]
+type = "tcp"
+
+[handler.client_tls]
+enabled = true
+
+[[handler]]
+type = "store"
+base_path = "/home/colin/work/actors/sentinel/.store"
+store_id = "sentinel"

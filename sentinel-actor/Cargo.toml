@@ -1,0 +1,13 @@
+[package]
+name = "sentinel"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "sentinel"
+crate-type = ["cdylib"]
+
+[dependencies]
+packr-guest = { version = "0.5.5", features = ["derive"] }
+serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
