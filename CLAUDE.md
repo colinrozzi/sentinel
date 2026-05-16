@@ -104,27 +104,23 @@ For phase 1 specifically: `handle-child-event` accumulates the chain, `handle-ch
 
 ## Gotchas
 
-### `supervisor.spawn` does NOT auto-call `actor.init`
+### `supervisor.spawn` semantics — pact change (theater PRs #58/#59/#60/#61/#62, May 2026)
 
-When you call `supervisor.spawn(manifest, None, None)`, theater creates the actor instance but does **not** invoke its `theater:simple/actor.init` export. The child sits there idle, never crashes, never sends chain events — and the supervisor loses its signal.
+The signature is now `spawn(manifest: string, init-state: value, wasm-bytes: option<list<u8>>) -> result<string, string>`, and `spawn` auto-calls the child's `actor.init` before returning the id. Do **not** follow up with a manual `rpc.call("theater:simple/actor.init", ...)` — that's a hangover from the pre-#59 era, and doing it now will double-init the child (clobbering whatever state init returned the first time).
 
-You must follow every successful `supervisor.spawn` with an explicit RPC into the child:
+For init-state, pass `Value::Option::None` of `list<u8>` when you have nothing specific to hand the child:
 
 ```rust
-let init_params = Value::Tuple(alloc::vec![Value::String(String::new())]);
-let _ = rpc_call(
-    child_id.clone(),
-    String::from("theater:simple/actor.init"),
-    init_params,
-    Value::Tuple(alloc::vec![]),
-);
+let init_state = Value::Option {
+    inner_type: ValueType::List(alloc::boxed::Box::new(ValueType::U8)),
+    value: None,
+};
+let child_id = supervisor_spawn(manifest.to_string(), init_state, None)?;
 ```
 
-The sentinel routes both initial spawn and crash-respawn through a `spawn_and_init` helper to keep this in one place. Anywhere you add a new spawn site, use that helper or reproduce the rpc-call pattern.
+Note: unlike `theater spawn` from the CLI (which falls back to the manifest's `initial_state` field per PR #61), the `supervisor.spawn` host function does **not** consult the child manifest's `initial_state`. The wasm caller passes init-state verbatim — Option None means the child's init literally sees Option None. If you want a child whose manifest declares its own `initial_state` to honor that string, you have to read the child manifest yourself and construct `Value::String(...)` to pass through.
 
-This bit us during the inbox migration in march 2026 (same surface area in `inbox/acceptor`), and again during the sentinel phase 1 rollout — pinning it here so the next agent doesn't rediscover it.
-
-(If theater's spawn semantics change later, revisit this note.)
+The sentinel routes both initial spawn and crash-respawn through a `spawn_child` helper for the standard "no init state" case.
 
 ### Inbox HTTPS responses close without TLS `close_notify`
 

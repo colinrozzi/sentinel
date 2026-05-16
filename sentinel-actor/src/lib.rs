@@ -14,7 +14,7 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
-use packr_guest::{export, import, pack_types, GraphValue, Value};
+use packr_guest::{export, import, pack_types, GraphValue, Value, ValueType};
 use serde::{Deserialize, Serialize};
 
 packr_guest::setup_guest!();
@@ -61,11 +61,8 @@ pack_types! {
             log: func(msg: string),
         }
         theater:simple/supervisor {
-            spawn: func(manifest: string, init-bytes: option<list<u8>>, wasm-bytes: option<list<u8>>) -> result<string, string>,
+            spawn: func(manifest: string, init-state: value, wasm-bytes: option<list<u8>>) -> result<string, string>,
             stop-child: func(child-id: string) -> result<_, string>,
-        }
-        theater:simple/rpc {
-            call: func(actor-id: string, function: string, params: value, options: value) -> value,
         }
         theater:simple/store {
             get: func(store-id: string, content-ref: string) -> result<list<u8>, string>,
@@ -97,15 +94,12 @@ fn log(msg: String);
 #[import(module = "theater:simple/supervisor", name = "spawn")]
 fn supervisor_spawn(
     manifest: String,
-    init_bytes: Option<Vec<u8>>,
+    init_state: Value,
     wasm_bytes: Option<Vec<u8>>,
 ) -> Result<String, String>;
 
 #[import(module = "theater:simple/supervisor", name = "stop-child")]
 fn supervisor_stop_child(child_id: String) -> Result<(), String>;
-
-#[import(module = "theater:simple/rpc", name = "call")]
-fn rpc_call(actor_id: String, function: String, params: Value, options: Value) -> Value;
 
 #[import(module = "theater:simple/tcp", name = "connect")]
 fn tcp_connect(address: String) -> Result<String, String>;
@@ -153,7 +147,7 @@ fn init(state: Value) -> Result<(SentinelState, ()), String> {
     let cfg: Config = serde_json::from_str(&raw)
         .map_err(|e| format!("sentinel: bad initial_state JSON: {}", e))?;
 
-    let child_id = spawn_and_init(&cfg.child_manifest)
+    let child_id = spawn_child(&cfg.child_manifest)
         .map_err(|e| format!("sentinel: spawn child failed: {}", e))?;
 
     Ok((
@@ -271,7 +265,7 @@ fn on_crash(mut state: SentinelState, child_id: &str, reason: &str) -> SentinelS
 
     // Respawn.
     state.restart_times.push(now_ms);
-    match spawn_and_init(&state.child_manifest) {
+    match spawn_child(&state.child_manifest) {
         Ok(new_id) => {
             state.child_id = new_id;
         }
@@ -286,28 +280,18 @@ fn on_crash(mut state: SentinelState, child_id: &str, reason: &str) -> SentinelS
     state
 }
 
-/// Spawn the child from `manifest` and immediately call its
-/// `theater:simple/actor.init` export via rpc.
-///
-/// supervisor.spawn does NOT auto-invoke actor.init unless init-bytes is set
-/// — see CLAUDE.md "Gotchas". Skipping the rpc-call leaves the child sitting
-/// idle, never crashing, never doing anything, and the sentinel loses its
-/// supervision signal. Always go through this helper.
-fn spawn_and_init(manifest: &str) -> Result<String, String> {
-    let child_id = supervisor_spawn(manifest.to_string(), None, None)?;
+/// Spawn the child from `manifest`. Post theater PRs #58–#60, supervisor.spawn
+/// auto-calls the child's `actor.init` before returning the id, so this helper
+/// is just a thin wrapper around the host call plus a log line. We pass
+/// `Value::Option::None` for init-state so the child's manifest `initial_state`
+/// is used (see CLAUDE.md "Gotchas").
+fn spawn_child(manifest: &str) -> Result<String, String> {
+    let init_state = Value::Option {
+        inner_type: ValueType::List(alloc::boxed::Box::new(ValueType::U8)),
+        value: None,
+    };
+    let child_id = supervisor_spawn(manifest.to_string(), init_state, None)?;
     log(format!("[sentinel] spawned child {}", child_id));
-    // Init params shape: a tuple holding the single `state: value` argument.
-    // We pass an empty string so children that don't need init state see a
-    // benign default; children that *do* need state should drive themselves
-    // off their own manifest's initial_state when launched directly, or we'd
-    // need a config knob here in a future phase.
-    let init_params = Value::Tuple(alloc::vec![Value::String(String::new())]);
-    let _ = rpc_call(
-        child_id.clone(),
-        String::from("theater:simple/actor.init"),
-        init_params,
-        Value::Tuple(alloc::vec![]),
-    );
     Ok(child_id)
 }
 
