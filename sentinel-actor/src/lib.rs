@@ -14,7 +14,7 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
-use packr_guest::{export, import, pack_types, GraphValue, Value, ValueType};
+use packr_guest::{export, import, pack_types, GraphValue, Value};
 use serde::{Deserialize, Serialize};
 
 packr_guest::setup_guest!();
@@ -61,7 +61,7 @@ pack_types! {
             log: func(msg: string),
         }
         theater:simple/supervisor {
-            spawn: func(manifest: string, init-state: value, wasm-bytes: option<list<u8>>) -> result<string, string>,
+            spawn: func(manifest: string, init-state: option<value>, wasm-bytes: option<list<u8>>) -> result<string, string>,
             stop-child: func(child-id: string) -> result<_, string>,
         }
         theater:simple/store {
@@ -94,7 +94,7 @@ fn log(msg: String);
 #[import(module = "theater:simple/supervisor", name = "spawn")]
 fn supervisor_spawn(
     manifest: String,
-    init_state: Value,
+    init_state: Option<Value>,
     wasm_bytes: Option<Vec<u8>>,
 ) -> Result<String, String>;
 
@@ -280,17 +280,12 @@ fn on_crash(mut state: SentinelState, child_id: &str, reason: &str) -> SentinelS
     state
 }
 
-/// Spawn the child from `manifest`. Post theater PRs #58–#60, supervisor.spawn
-/// auto-calls the child's `actor.init` before returning the id, so this helper
-/// is just a thin wrapper around the host call plus a log line. We pass
-/// `Value::Option::None` for init-state so the child's manifest `initial_state`
-/// is used (see CLAUDE.md "Gotchas").
+/// Spawn the child from `manifest`. Post theater PRs #58–#63, supervisor.spawn
+/// auto-calls the child's `actor.init` before returning the id, and passing
+/// `None` for init-state lets the child's manifest `initial_state` carry the
+/// state (see CLAUDE.md "Gotchas").
 fn spawn_child(manifest: &str) -> Result<String, String> {
-    let init_state = Value::Option {
-        inner_type: ValueType::List(alloc::boxed::Box::new(ValueType::U8)),
-        value: None,
-    };
-    let child_id = supervisor_spawn(manifest.to_string(), init_state, None)?;
+    let child_id = supervisor_spawn(manifest.to_string(), None, None)?;
     log(format!("[sentinel] spawned child {}", child_id));
     Ok(child_id)
 }

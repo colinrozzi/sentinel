@@ -104,23 +104,24 @@ For phase 1 specifically: `handle-child-event` accumulates the chain, `handle-ch
 
 ## Gotchas
 
-### `supervisor.spawn` semantics — pact change (theater PRs #58/#59/#60/#61/#62, May 2026)
+### `supervisor.spawn` semantics — pact change (theater PRs #58/#59/#60/#61/#62/#63, May 2026)
 
-The signature is now `spawn(manifest: string, init-state: value, wasm-bytes: option<list<u8>>) -> result<string, string>`, and `spawn` auto-calls the child's `actor.init` before returning the id. Do **not** follow up with a manual `rpc.call("theater:simple/actor.init", ...)` — that's a hangover from the pre-#59 era, and doing it now will double-init the child (clobbering whatever state init returned the first time).
+The signature is now `spawn(manifest: string, init-state: option<value>, wasm-bytes: option<list<u8>>) -> result<string, string>`, and `spawn` auto-calls the child's `actor.init` before returning the id. Do **not** follow up with a manual `rpc.call("theater:simple/actor.init", ...)` — that's a hangover from the pre-#59 era, and doing it now will double-init the child (clobbering whatever state init returned the first time).
 
-For init-state, pass `Value::Option::None` of `list<u8>` when you have nothing specific to hand the child:
+Pass `None` for `init-state` to let the child's manifest `initial_state` carry the state (PR #63 wired the supervisor.spawn-side fallback to match what `theater spawn` from the CLI does per PR #61):
 
 ```rust
-let init_state = Value::Option {
-    inner_type: ValueType::List(alloc::boxed::Box::new(ValueType::U8)),
-    value: None,
-};
+let child_id = supervisor_spawn(manifest.to_string(), None, None)?;
+```
+
+Pass `Some(value)` to override the manifest:
+
+```rust
+let init_state = Some(Value::String(json_config));
 let child_id = supervisor_spawn(manifest.to_string(), init_state, None)?;
 ```
 
-Note: unlike `theater spawn` from the CLI (which falls back to the manifest's `initial_state` field per PR #61), the `supervisor.spawn` host function does **not** consult the child manifest's `initial_state`. The wasm caller passes init-state verbatim — Option None means the child's init literally sees Option None. If you want a child whose manifest declares its own `initial_state` to honor that string, you have to read the child manifest yourself and construct `Value::String(...)` to pass through.
-
-The sentinel routes both initial spawn and crash-respawn through a `spawn_child` helper for the standard "no init state" case.
+The sentinel routes both initial spawn and crash-respawn through a `spawn_child` helper that does the manifest-fallback "no init state" case (the inbox-acceptor case).
 
 ### Inbox HTTPS responses close without TLS `close_notify`
 
