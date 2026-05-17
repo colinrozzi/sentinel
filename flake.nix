@@ -11,7 +11,10 @@
     crane.url = "github:ipetkov/crane";
 
     theater = {
-      url = "github:colinrozzi/theater/release-20260512";
+      # Tracking main (post-PR-#58/#59/#60) — supervisor.spawn signature
+      # changed to (manifest, init-state: value, wasm-bytes) with auto-init.
+      # Switch back to a release branch once one is cut after these merges.
+      url = "github:colinrozzi/theater/main";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.rust-overlay.follows = "rust-overlay";
       inputs.crane.follows = "crane";
