@@ -63,15 +63,15 @@ done
 
 ## What sentinel is
 
-A long-running actor that owns one supervised child actor system. It catches crashes, notifies the corresponding development agent, restarts the child, and (eventually) handles HTTPS-triggered binary deploys from GitHub Actions.
+A long-running actor that owns one supervised child actor system. It catches crashes, restarts the child (subject to a crash-loop rate limit), and (eventually) handles HTTPS-triggered binary deploys from GitHub Actions.
 
 ```
 sentinel (top-level systemd unit)
   ├── supervisor.spawn → child actor (e.g. inbox's acceptor, tickets' acceptor)
   └── supervisor-handlers callbacks:
-        handle-child-event       → accumulate chain in memory
-        handle-child-error       → email dev + respawn
-        handle-child-exit        → email dev + respawn (if exit-with-error)
+        handle-child-event       → accumulate chain in memory (capped)
+        handle-child-error       → log + respawn (rate-limited)
+        handle-child-exit        → log + respawn (rate-limited)
         handle-child-external-stop → no respawn (intentional)
 
 (phase 2)
@@ -80,9 +80,8 @@ sentinel (top-level systemd unit)
 
 Config arrives via `manifest.toml`'s `initial_state` as a JSON document:
 - `child_manifest` — absolute path to child's manifest.toml
-- `dev_email` — who to email on failure
-- `inbox_api` — the inbox API host:port
-- `inbox_token` — bearer token for the inbox
+
+(The inbox-API config fields — `dev_email`, `inbox_api`, `inbox_token` — were dropped when the email-on-crash path was stripped. See "Deferred" below.)
 
 See `README.md` for the API + phase roadmap.
 
@@ -100,7 +99,7 @@ Exports (theater calls these on you):
 - `theater:simple/supervisor-handlers.handle-child-exit(child-id, result)` — child exited (clean or with non-zero result)
 - `theater:simple/supervisor-handlers.handle-child-external-stop(child-id)` — child was stopped by `stop-child` or system shutdown
 
-For phase 1 specifically: `handle-child-event` accumulates the chain, `handle-child-error` and `handle-child-exit` are the crash hooks. `handle-child-external-stop` should not respawn — it means "we asked for this, leave it stopped".
+In sentinel today: `handle-child-event` accumulates the chain ring buffer, `handle-child-error` and `handle-child-exit` log a crash summary and respawn (subject to the rate limiter), and `handle-child-external-stop` is a no-op (intentional shutdown). The chain buffer is reset after each crash — its contents belonged to the run that just ended.
 
 ## Gotchas
 
@@ -122,12 +121,6 @@ let child_id = supervisor_spawn(manifest.to_string(), init_state, None)?;
 ```
 
 The sentinel routes both initial spawn and crash-respawn through a `spawn_child` helper that does the manifest-fallback "no init state" case (the inbox-acceptor case).
-
-### Inbox HTTPS responses close without TLS `close_notify`
-
-The inbox server terminates connections by closing the TCP socket without sending a TLS `close_notify` alert; rustls (in theater's wasm-tcp + tls-upgrade path) is strict and surfaces this as a `recv` error on the next read. The HTTP POST itself succeeds — the email lands — but our `tcp_receive` returns an error before we can read the status line.
-
-The sentinel handles this by treating a recv error as EOF and logging `inbox: response unreadable; assuming delivered ...` when we get no status back. Don't take that log line as a real failure unless emails actually stop showing up at the dev's mailbox.
 
 ## Development process
 
@@ -217,19 +210,31 @@ When responding to a request:
 
 **Always cc `colinrozzi@gmail.com` on completion + blocking replies.**
 
-## Phase 1 success criteria
+## Current behavior
 
-The phase 1 ticket asks for:
-- An in-memory chain buffer accumulated via `handle-child-event` (or store-backed if you'd rather)
-- On `handle-child-error` or `handle-child-exit` (with non-zero result): serialize the chain, POST to `<inbox_api>/v1/mailboxes/<dev_email>/send` with subject like `[sentinel] <child-id> crashed`, body containing the chain (or a truncated tail of it for large chains)
-- After the email POST returns (success or otherwise), respawn the child via `supervisor.spawn` and update `state.child_id`
-- A respawn rate limiter — at most N restarts in M seconds; beyond that, log + don't respawn (we don't want a tight crash-loop hammering the inbox)
-- A minimal test: have the sentinel supervise a deliberately-crashing child wasm, watch the email land in the dev's mailbox
+- Spawns a configured child manifest on init via `supervisor.spawn` (auto-init, manifest-fallback init-state).
+- Accumulates child chain events via `handle-child-event` into an in-memory ring buffer (`MAX_CHAIN_EVENTS = 500`; oldest dropped past cap with a `chain_truncated` flag).
+- On `handle-child-error` / `handle-child-exit`: logs a one-line crash summary (`child=… reason=… t_ms=… chain_size=… recent_restarts=…`), resets the chain, and respawns — unless the rate limiter has tripped.
+- Rate limiter: `RATE_LIMIT_N = 5` restarts within `RATE_LIMIT_M_MS = 60_000`. On trip, logs `[sentinel] crash loop ...`, sets `restart_blocked`, and stops respawning. Further crashes log `crashed while already in blocked state — not respawning`. Restart the sentinel process to unblock.
+- `handle-child-external-stop` is a no-op (intentional shutdown).
+
+End-to-end: `tests/crashing-child/` plus `theater spawn sentinel-actor/manifest.toml` (pointed at the crashing-child manifest) should show 5 spawn→exit→respawn cycles followed by the rate-limit trip on crash #6 — no emails or external I/O.
+
+## Deferred: out-of-band crash notification
+
+Phase 1 originally shipped a crash-email path via the inbox HTTP API. We pulled it (ticket #43) because of a circular bootstrap dependency: sentinel-supervises-inbox would silently fail to alert when inbox is the thing that's down. The dev-agent mailbox (`inbox-dev@`) is also hosted on the same inbox, so neither Colin (via the gmail relay) nor the agent would get the wake-up. Silent failure in the most important case.
+
+Open design space — none committed:
+- Direct-to-gmail-MX bypass (sentinel speaks SMTP to gmail's MX servers directly, no inbox dependency)
+- Retry queue (persist crash payloads, drain when inbox comes back)
+- Alternate transport entirely (file/syslog/exec-a-shell-script)
+
+For now operators watch the systemd journal for `[sentinel] crash ...` and `[sentinel] crash loop ...` lines. The in-memory chain buffer is still accumulated so it can re-attach to whatever notification path we eventually pick.
 
 ## Known limitations / explicitly-deferred work
 
 - No HTTPS deploy endpoint yet — phase 2.
-- No attachment support in the inbox — chain ships inline in the body for now (truncate aggressively; we'll wait on inbox-dev's attachment work before going long-chain).
+- No out-of-band notification — see "Deferred" above.
 - No multi-child sentinel — one sentinel process supervises one child system. Multi-child can come later.
 - No signature/checksum verification on binaries yet — that arrives with phase 2's deploy endpoint.
 
