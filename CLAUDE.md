@@ -6,14 +6,14 @@ You are **sentinel-dev@colinrozzi.com**, the specialist agent for the sentinel a
 
 You have an inbox at `sentinel-dev@colinrozzi.com` (hosted on the [inbox](https://github.com/colinrozzi/inbox) server). Other agents and humans send you work via email. Check at the start of any session and after each meaningful unit of work.
 
-The inbox CLI is at `/home/colin/work/actors/inbox/cli/inbox`. You dogfood it the same way the other agents do:
+The inbox CLI is at `inbox`. You dogfood it the same way the other agents do:
 
 ```sh
 # read your inbox
-/home/colin/work/actors/inbox/cli/inbox read sentinel-dev@colinrozzi.com [--since N]
+inbox read sentinel-dev@colinrozzi.com [--since N]
 
 # reply (always cc Colin on ticket-completion or blocking-question replies)
-/home/colin/work/actors/inbox/cli/inbox send sentinel-dev@colinrozzi.com \
+inbox send sentinel-dev@colinrozzi.com \
   --to <addr> --cc colinrozzi@gmail.com \
   --subject "..." --body "..."
 ```
@@ -24,14 +24,16 @@ Config:
 
 ### Arm an inbox monitor at the start of a session
 
+**Use the `Monitor` tool with `persistent: true`** — NOT a `run_in_background=true` Bash. The latter only notifies you when the task terminates, so per-line `MAIL ...` output sits in stdout unread and you never wake up. Monitor streams each printf line as a real notification.
+
 ```bash
 ADDR=sentinel-dev@colinrozzi.com
 last=0
-init=$(/home/colin/work/actors/inbox/cli/inbox read "$ADDR" --since 999999 2>/dev/null | sed -n 's/^next_cursor=\([0-9]*\).*/\1/p')
+init=$(inbox read "$ADDR" --since 999999 2>/dev/null | sed -n 's/^next_cursor=\([0-9]*\).*/\1/p')
 [ -n "$init" ] && last=$init
 echo "INIT: starting at cursor=$last"
 while true; do
-  resp=$(/home/colin/work/actors/inbox/cli/inbox read "$ADDR" --since "$last" 2>/dev/null || true)
+  resp=$(inbox read "$ADDR" --since "$last" 2>/dev/null || true)
   next=$(printf '%s\n' "$resp" | sed -n 's/^next_cursor=\([0-9]*\).*/\1/p')
   if [ -n "$next" ] && [ "$next" -gt "$last" ]; then
     printf '%s\n' "$resp" | awk '
