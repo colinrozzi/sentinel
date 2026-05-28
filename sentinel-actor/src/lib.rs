@@ -10,6 +10,12 @@
 //! child. The child's manifest is held in memory as a template with a
 //! `__PACKAGE__` placeholder; "start" swaps the package URL/path and respawns.
 //!
+//! The rendered child manifest TOML is written to sentinel's own content store
+//! (label `child-manifest-current`) at every spawn and theater is handed a
+//! `store://sentinel/child-manifest-current` URI. theater's resolve_reference
+//! supports only store://, http(s)://, and bare-filesystem-paths — inline
+//! manifest content is not supported, so the store hop is mandatory.
+//!
 //! Notification is intentionally absent right now — the original phase 1
 //! email-on-crash path went through the inbox, which is exactly what
 //! sentinel-supervises-inbox would have down at the moment we'd want to
@@ -46,6 +52,12 @@ const RECV_CHUNK: u32 = 4096;
 /// Placeholder substituted with the current package URL when rendering the
 /// child manifest TOML at spawn time.
 const PACKAGE_PLACEHOLDER: &str = "__PACKAGE__";
+/// Content-store ID that sentinel's manifest declares — must match
+/// sentinel-actor/manifest.toml's `[[handler]] type = "store"` `store_id`.
+const STORE_ID: &str = "sentinel";
+/// Stable label under which sentinel writes the rendered child manifest TOML
+/// before handing theater a `store://` URI. Overwritten on each spawn.
+const CHILD_MANIFEST_LABEL: &str = "child-manifest-current";
 
 // ============================================================================
 // State
@@ -105,6 +117,9 @@ pack_types! {
             receive: func(connection-id: string, max-bytes: u32) -> result<list<u8>, string>,
             close: func(connection-id: string) -> result<_, string>,
         }
+        theater:simple/store {
+            store-at-label: func(store-id: string, label: string, content: list<u8>) -> result<string, string>,
+        }
     }
     exports {
         theater:simple/actor.init: func(state: value) -> result<sentinel-state, string>,
@@ -146,6 +161,9 @@ fn tcp_receive(connection_id: String, max_bytes: u32) -> Result<Vec<u8>, String>
 
 #[import(module = "theater:simple/tcp", name = "close")]
 fn tcp_close(connection_id: String) -> Result<(), String>;
+
+#[import(module = "theater:simple/store", name = "store-at-label")]
+fn store_at_label(store_id: String, label: String, content: Vec<u8>) -> Result<String, String>;
 
 // ============================================================================
 // Config — what the operator hands us via initial_state
@@ -587,9 +605,12 @@ fn on_crash(mut state: SentinelState, child_id: &str, reason: &str) -> SentinelS
 }
 
 /// Render the child manifest TOML by substituting the current package URL
-/// and any configured secrets into the template, then spawn it. Theater
-/// handles https:// fetch + the `actor.init` autocall internally (see
-/// CLAUDE.md "Gotchas" for the pact).
+/// and any configured secrets into the template, write it to sentinel's
+/// content store, and hand theater a `store://` URI. theater's
+/// resolve_reference (crates/theater/src/utils/mod.rs) only understands
+/// store:// / http(s):// / filesystem-path — there is no inline-content
+/// support, so the rendered TOML *must* be written somewhere theater can
+/// fetch it. Sentinel's own store is the cheapest landing pad.
 ///
 /// Substitution order: secrets first, then `__PACKAGE__`. A secret value
 /// containing `__PACKAGE__` would therefore *also* get the package
@@ -604,12 +625,22 @@ fn spawn_child(state: &SentinelState) -> Result<String, String> {
         manifest_toml = manifest_toml.replace(&placeholder, value);
     }
     manifest_toml = manifest_toml.replace(PACKAGE_PLACEHOLDER, &state.current_package);
-    let child_id = supervisor_spawn(manifest_toml, None, None)?;
+
+    store_at_label(
+        String::from(STORE_ID),
+        String::from(CHILD_MANIFEST_LABEL),
+        manifest_toml.into_bytes(),
+    )
+    .map_err(|e| format!("store-at-label failed: {}", e))?;
+
+    let manifest_uri = format!("store://{}/{}", STORE_ID, CHILD_MANIFEST_LABEL);
+    let child_id = supervisor_spawn(manifest_uri.clone(), None, None)?;
     log(format!(
-        "[sentinel] spawned child {} (package={}, secrets={})",
+        "[sentinel] spawned child {} (package={}, secrets={}, manifest={})",
         child_id,
         state.current_package,
-        state.secret_names.len()
+        state.secret_names.len(),
+        manifest_uri,
     ));
     Ok(child_id)
 }
