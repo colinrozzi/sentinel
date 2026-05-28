@@ -3,7 +3,10 @@ version = "0.1.0"
 package = "/home/colin/work/actors/sentinel/target/wasm32-unknown-unknown/release/sentinel.wasm"
 # initial_state is a JSON blob (replace at deploy time):
 #   {
-#     "child_manifest": "/abs/path/to/child/manifest.toml"
+#     "child_manifest_template": "<TOML body with __PACKAGE__ placeholder>",
+#     "default_package": "<URL or path to wasm artifact for initial spawn>",
+#     "listen_addr": "0.0.0.0:8443",
+#     "bearer_token": "<shared secret for the deploy endpoint>"
 #   }
 initial_state = "{}"
 
@@ -12,6 +15,9 @@ type = "runtime"
 
 [[handler]]
 type = "supervisor"
+
+[[handler]]
+type = "tcp"
 
 [[handler]]
 type = "store"
