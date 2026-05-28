@@ -1,14 +1,20 @@
 //! Sentinel actor.
 //!
-//! Watches one supervised child. Accumulates a per-event chain summary in
-//! memory; on child error / exit, logs a crash line and respawns (subject to
-//! a crash-loop rate limiter). An external stop never respawns.
+//! Phase 1 (existing): supervises one child actor. Accumulates a per-event
+//! chain summary in memory; on child error / exit, logs a crash line and
+//! respawns (subject to a crash-loop rate limiter). An external stop never
+//! respawns.
+//!
+//! Phase 2 (new): exposes a bearer-token-authenticated TCP+JSON command
+//! surface (start, stop, list, get_chain, health) for managing the supervised
+//! child. The child's manifest is held in memory as a template with a
+//! `__PACKAGE__` placeholder; "start" swaps the package URL/path and respawns.
 //!
 //! Notification is intentionally absent right now — the original phase 1
 //! email-on-crash path went through the inbox, which is exactly what
 //! sentinel-supervises-inbox would have down at the moment we'd want to
 //! notify. Circular bootstrap dependency. See CLAUDE.md "Deferred" for the
-//! design space; phase 2 (HTTPS deploy endpoint) is the next ticket.
+//! design space.
 
 #![no_std]
 extern crate alloc;
@@ -17,7 +23,7 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use packr_guest::{export, import, pack_types, GraphValue, Value};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 packr_guest::setup_guest!();
 
@@ -33,6 +39,14 @@ const MAX_EVENT_PAYLOAD_BYTES: usize = 256;
 const RATE_LIMIT_N: usize = 5;
 const RATE_LIMIT_M_MS: u64 = 60_000;
 
+/// Max bytes accepted in a single inbound command line.
+const MAX_REQUEST_BYTES: usize = 64 * 1024;
+/// Per-call tcp.receive cap. We loop until newline / EOF / MAX_REQUEST_BYTES.
+const RECV_CHUNK: u32 = 4096;
+/// Placeholder substituted with the current package URL when rendering the
+/// child manifest TOML at spawn time.
+const PACKAGE_PLACEHOLDER: &str = "__PACKAGE__";
+
 // ============================================================================
 // State
 // ============================================================================
@@ -40,7 +54,18 @@ const RATE_LIMIT_M_MS: u64 = 60_000;
 #[derive(Clone, GraphValue)]
 #[graph(crate = "packr_guest::composite_abi")]
 pub struct SentinelState {
-    pub child_manifest: String,
+    /// Child manifest TOML body containing PACKAGE_PLACEHOLDER. Sentinel
+    /// substitutes the current_package URL into this template at every spawn.
+    pub manifest_template: String,
+    /// The package URL / path that supervises.spawn should resolve. Mutated
+    /// by the `start` command.
+    pub current_package: String,
+    /// TCP address sentinel listens on for inbound commands.
+    pub listen_addr: String,
+    /// Shared secret required on every inbound command. Compared byte-for-byte.
+    pub bearer_token: String,
+    /// Listener handle returned by `tcp.listen` at init.
+    pub listener_id: String,
     pub child_id: String,
     /// One line per recorded chain event: "<event_type> <truncated_payload>".
     pub chain: Vec<String>,
@@ -50,7 +75,8 @@ pub struct SentinelState {
     /// the rate-limit check.
     pub restart_times: Vec<u64>,
     /// Once true, the rate limiter has fired and we no longer respawn.
-    /// Operator intervention required to unblock (restart the sentinel).
+    /// Operator intervention required to unblock (`start` command or restart
+    /// the sentinel process).
     pub restart_blocked: bool,
 }
 
@@ -61,9 +87,17 @@ pack_types! {
         }
         theater:simple/supervisor {
             spawn: func(manifest: string, init-state: option<value>, wasm-bytes: option<list<u8>>) -> result<string, string>,
+            stop-child: func(child-id: string) -> result<_, string>,
         }
         theater:simple/timer {
             now: func() -> u64,
+        }
+        theater:simple/tcp {
+            listen: func(address: string) -> result<string, string>,
+            activate: func(connection-id: string) -> result<_, string>,
+            send: func(connection-id: string, data: list<u8>) -> result<u64, string>,
+            receive: func(connection-id: string, max-bytes: u32) -> result<list<u8>, string>,
+            close: func(connection-id: string) -> result<_, string>,
         }
     }
     exports {
@@ -72,6 +106,7 @@ pack_types! {
         theater:simple/supervisor-handlers.handle-child-exit: func(state: sentinel-state, child-id: string, result: value) -> result<sentinel-state, string>,
         theater:simple/supervisor-handlers.handle-child-external-stop: func(state: sentinel-state, child-id: string) -> result<sentinel-state, string>,
         theater:simple/supervisor-handlers.handle-child-event: func(state: sentinel-state, event-type: string, event-data: list<u8>) -> result<sentinel-state, string>,
+        theater:simple/tcp-client.handle-connection: func(state: sentinel-state, connection-id: string) -> result<sentinel-state, string>,
     }
 }
 
@@ -85,8 +120,26 @@ fn supervisor_spawn(
     wasm_bytes: Option<Vec<u8>>,
 ) -> Result<String, String>;
 
+#[import(module = "theater:simple/supervisor", name = "stop-child")]
+fn supervisor_stop_child(child_id: String) -> Result<(), String>;
+
 #[import(module = "theater:simple/timer", name = "now")]
 fn timer_now() -> u64;
+
+#[import(module = "theater:simple/tcp", name = "listen")]
+fn tcp_listen(address: String) -> Result<String, String>;
+
+#[import(module = "theater:simple/tcp", name = "activate")]
+fn tcp_activate(connection_id: String) -> Result<(), String>;
+
+#[import(module = "theater:simple/tcp", name = "send")]
+fn tcp_send(connection_id: String, data: Vec<u8>) -> Result<u64, String>;
+
+#[import(module = "theater:simple/tcp", name = "receive")]
+fn tcp_receive(connection_id: String, max_bytes: u32) -> Result<Vec<u8>, String>;
+
+#[import(module = "theater:simple/tcp", name = "close")]
+fn tcp_close(connection_id: String) -> Result<(), String>;
 
 // ============================================================================
 // Config — what the operator hands us via initial_state
@@ -94,8 +147,15 @@ fn timer_now() -> u64;
 
 #[derive(Deserialize)]
 struct Config {
-    /// Absolute path to the child actor's manifest.toml.
-    child_manifest: String,
+    /// Child manifest TOML body with `__PACKAGE__` placeholder for the package URL.
+    child_manifest_template: String,
+    /// Initial package URL or path that fills the placeholder until `start` rewrites it.
+    default_package: String,
+    /// TCP listen address, e.g. "0.0.0.0:8443".
+    listen_addr: String,
+    /// Shared secret for the deploy endpoint. Compared byte-for-byte against
+    /// each request's `token` field.
+    bearer_token: String,
 }
 
 // ============================================================================
@@ -113,20 +173,41 @@ fn init(state: Value) -> Result<(SentinelState, ()), String> {
     let cfg: Config = serde_json::from_str(&raw)
         .map_err(|e| format!("sentinel: bad initial_state JSON: {}", e))?;
 
-    let child_id = spawn_child(&cfg.child_manifest)
-        .map_err(|e| format!("sentinel: spawn child failed: {}", e))?;
+    if !cfg.child_manifest_template.contains(PACKAGE_PLACEHOLDER) {
+        return Err(format!(
+            "sentinel: child_manifest_template must contain placeholder {}",
+            PACKAGE_PLACEHOLDER
+        ));
+    }
+    if cfg.bearer_token.is_empty() {
+        return Err(String::from("sentinel: bearer_token must be non-empty"));
+    }
 
-    Ok((
-        SentinelState {
-            child_manifest: cfg.child_manifest,
-            child_id,
-            chain: Vec::new(),
-            chain_truncated: false,
-            restart_times: Vec::new(),
-            restart_blocked: false,
-        },
-        (),
-    ))
+    let listener_id = tcp_listen(cfg.listen_addr.clone())
+        .map_err(|e| format!("sentinel: tcp.listen({}) failed: {}", cfg.listen_addr, e))?;
+    log(format!(
+        "[sentinel] listening on {} (id={})",
+        cfg.listen_addr, listener_id
+    ));
+
+    let mut state = SentinelState {
+        manifest_template: cfg.child_manifest_template,
+        current_package: cfg.default_package,
+        listen_addr: cfg.listen_addr,
+        bearer_token: cfg.bearer_token,
+        listener_id,
+        child_id: String::new(),
+        chain: Vec::new(),
+        chain_truncated: false,
+        restart_times: Vec::new(),
+        restart_blocked: false,
+    };
+
+    let child_id = spawn_child(&state)
+        .map_err(|e| format!("sentinel: spawn child failed: {}", e))?;
+    state.child_id = child_id;
+
+    Ok((state, ()))
 }
 
 #[export(name = "theater:simple/supervisor-handlers.handle-child-event")]
@@ -179,6 +260,255 @@ fn handle_child_external_stop(
 }
 
 // ============================================================================
+// TCP command surface
+// ============================================================================
+
+#[derive(Deserialize)]
+struct Request {
+    token: String,
+    cmd: String,
+    /// Used by `start`. The new package URL/path; the manifest template gets
+    /// rendered with this value before the spawn.
+    #[serde(default)]
+    package: Option<String>,
+}
+
+#[derive(Serialize)]
+struct HealthResp<'a> {
+    ok: bool,
+    child_id: &'a str,
+    restart_blocked: bool,
+    recent_restarts: usize,
+    chain_size: usize,
+    chain_truncated: bool,
+    listen_addr: &'a str,
+}
+
+#[derive(Serialize)]
+struct ListResp<'a> {
+    ok: bool,
+    child_id: &'a str,
+    current_package: &'a str,
+}
+
+#[derive(Serialize)]
+struct GetChainResp<'a> {
+    ok: bool,
+    chain: &'a [String],
+    chain_truncated: bool,
+}
+
+#[derive(Serialize)]
+struct StartResp<'a> {
+    ok: bool,
+    child_id: &'a str,
+    current_package: &'a str,
+}
+
+#[derive(Serialize)]
+struct StopResp<'a> {
+    ok: bool,
+    stopped_child_id: &'a str,
+}
+
+#[derive(Serialize)]
+struct ErrResp<'a> {
+    ok: bool,
+    error: &'a str,
+}
+
+#[export(name = "theater:simple/tcp-client.handle-connection")]
+fn handle_connection(
+    state: SentinelState,
+    connection_id: String,
+) -> Result<(SentinelState, ()), String> {
+    // Single-failing-connection must not kill the listener: catch internal
+    // errors, log + close, carry on. (Same defensive pattern as inbox-acceptor.)
+    let mut state = state;
+    if let Err(e) = handle_connection_inner(&mut state, &connection_id) {
+        log(format!(
+            "[sentinel] handle-connection failed (conn={}): {}",
+            connection_id, e
+        ));
+        let _ = tcp_close(connection_id);
+    }
+    Ok((state, ()))
+}
+
+fn handle_connection_inner(state: &mut SentinelState, conn_id: &str) -> Result<(), String> {
+    // accept() returned a PENDING connection per tcp.pact — activate it first.
+    tcp_activate(conn_id.to_string())
+        .map_err(|e| format!("activate: {}", e))?;
+    let request_bytes = receive_line(conn_id)?;
+    let response_bytes = dispatch_request(state, &request_bytes);
+    tcp_send(conn_id.to_string(), response_bytes)
+        .map_err(|e| format!("send: {}", e))?;
+    tcp_close(conn_id.to_string())
+        .map_err(|e| format!("close: {}", e))?;
+    Ok(())
+}
+
+fn receive_line(conn_id: &str) -> Result<Vec<u8>, String> {
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        if buf.len() >= MAX_REQUEST_BYTES {
+            return Err(format!("request exceeds {} bytes", MAX_REQUEST_BYTES));
+        }
+        let chunk = tcp_receive(conn_id.to_string(), RECV_CHUNK)
+            .map_err(|e| format!("receive: {}", e))?;
+        if chunk.is_empty() {
+            // EOF from peer.
+            break;
+        }
+        buf.extend_from_slice(&chunk);
+        if buf.iter().any(|&b| b == b'\n') {
+            break;
+        }
+    }
+    if buf.is_empty() {
+        return Err(String::from("empty request"));
+    }
+    Ok(buf)
+}
+
+fn dispatch_request(state: &mut SentinelState, request_bytes: &[u8]) -> Vec<u8> {
+    let req: Request = match serde_json::from_slice(request_bytes) {
+        Ok(r) => r,
+        Err(e) => return error_response(&format!("bad request JSON: {}", e)),
+    };
+    if !ct_eq(req.token.as_bytes(), state.bearer_token.as_bytes()) {
+        // Don't leak which header failed; one error for any auth failure.
+        return error_response("unauthorized");
+    }
+    match req.cmd.as_str() {
+        "health" => cmd_health(state),
+        "list" => cmd_list(state),
+        "get_chain" => cmd_get_chain(state),
+        "start" => cmd_start(state, req.package),
+        "stop" => cmd_stop(state),
+        other => error_response(&format!("unknown cmd: {}", other)),
+    }
+}
+
+fn cmd_health(state: &SentinelState) -> Vec<u8> {
+    let now_ms = timer_now();
+    let recent = state
+        .restart_times
+        .iter()
+        .filter(|t| now_ms.saturating_sub(**t) <= RATE_LIMIT_M_MS)
+        .count();
+    encode(&HealthResp {
+        ok: true,
+        child_id: &state.child_id,
+        restart_blocked: state.restart_blocked,
+        recent_restarts: recent,
+        chain_size: state.chain.len(),
+        chain_truncated: state.chain_truncated,
+        listen_addr: &state.listen_addr,
+    })
+}
+
+fn cmd_list(state: &SentinelState) -> Vec<u8> {
+    encode(&ListResp {
+        ok: true,
+        child_id: &state.child_id,
+        current_package: &state.current_package,
+    })
+}
+
+fn cmd_get_chain(state: &SentinelState) -> Vec<u8> {
+    encode(&GetChainResp {
+        ok: true,
+        chain: &state.chain,
+        chain_truncated: state.chain_truncated,
+    })
+}
+
+fn cmd_start(state: &mut SentinelState, package: Option<String>) -> Vec<u8> {
+    let Some(new_package) = package else {
+        return error_response("start requires `package` field");
+    };
+    if new_package.is_empty() {
+        return error_response("start `package` must be non-empty");
+    }
+
+    // Operator intent: a `start` resets the crash-loop block. Without this
+    // a recovered child could never come up after the limiter trips, even
+    // when the operator has fixed the underlying issue.
+    state.restart_blocked = false;
+    state.restart_times.clear();
+
+    // Stop the current child if it's still alive. We tolerate stop failure
+    // (it may already be dead from a prior crash). External-stop handler
+    // is a no-op so this won't trigger an unwanted respawn.
+    if !state.child_id.is_empty() {
+        let _ = supervisor_stop_child(state.child_id.clone());
+    }
+
+    state.current_package = new_package;
+    match spawn_child(state) {
+        Ok(new_id) => {
+            state.child_id = new_id.clone();
+            state.chain.clear();
+            state.chain_truncated = false;
+            encode(&StartResp {
+                ok: true,
+                child_id: &state.child_id,
+                current_package: &state.current_package,
+            })
+        }
+        Err(e) => error_response(&format!("spawn failed: {}", e)),
+    }
+}
+
+fn cmd_stop(state: &mut SentinelState) -> Vec<u8> {
+    if state.child_id.is_empty() {
+        return error_response("no child to stop");
+    }
+    let stopped = state.child_id.clone();
+    if let Err(e) = supervisor_stop_child(stopped.clone()) {
+        return error_response(&format!("stop failed: {}", e));
+    }
+    encode(&StopResp {
+        ok: true,
+        stopped_child_id: &stopped,
+    })
+}
+
+fn encode<T: Serialize>(value: &T) -> Vec<u8> {
+    match serde_json::to_vec(value) {
+        Ok(mut v) => {
+            v.push(b'\n');
+            v
+        }
+        Err(e) => error_response(&format!("encode failed: {}", e)),
+    }
+}
+
+fn error_response(msg: &str) -> Vec<u8> {
+    // Best-effort — if even error encoding fails we send a hardcoded line.
+    match serde_json::to_vec(&ErrResp { ok: false, error: msg }) {
+        Ok(mut v) => {
+            v.push(b'\n');
+            v
+        }
+        Err(_) => b"{\"ok\":false,\"error\":\"encode failure\"}\n".to_vec(),
+    }
+}
+
+/// Constant-time byte comparison so token-equality leak is bounded by length.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+// ============================================================================
 // Crash handling
 // ============================================================================
 
@@ -224,7 +554,7 @@ fn on_crash(mut state: SentinelState, child_id: &str, reason: &str) -> SentinelS
     }
 
     state.restart_times.push(now_ms);
-    match spawn_child(&state.child_manifest) {
+    match spawn_child(&state) {
         Ok(new_id) => {
             state.child_id = new_id;
         }
@@ -239,13 +569,18 @@ fn on_crash(mut state: SentinelState, child_id: &str, reason: &str) -> SentinelS
     state
 }
 
-/// Spawn the child from `manifest`. Post theater PRs #58–#63, supervisor.spawn
-/// auto-calls the child's `actor.init` before returning the id, and passing
-/// `None` for init-state lets the child's manifest `initial_state` carry the
-/// state (see CLAUDE.md "Gotchas").
-fn spawn_child(manifest: &str) -> Result<String, String> {
-    let child_id = supervisor_spawn(manifest.to_string(), None, None)?;
-    log(format!("[sentinel] spawned child {}", child_id));
+/// Render the child manifest TOML by substituting the current package URL
+/// into the template, then spawn it. Theater handles https:// fetch + the
+/// `actor.init` autocall internally (see CLAUDE.md "Gotchas" for the pact).
+fn spawn_child(state: &SentinelState) -> Result<String, String> {
+    let manifest_toml = state
+        .manifest_template
+        .replace(PACKAGE_PLACEHOLDER, &state.current_package);
+    let child_id = supervisor_spawn(manifest_toml, None, None)?;
+    log(format!(
+        "[sentinel] spawned child {} (package={})",
+        child_id, state.current_package
+    ));
     Ok(child_id)
 }
 
