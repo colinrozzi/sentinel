@@ -25,13 +25,24 @@ Runs as the top-level process for an actor system: spawns the configured child m
 ```json
 {
   "child_manifest_template": "name = \"tickets\"\nversion = \"0.1.0\"\npackage = \"__PACKAGE__\"\n\n[[handler]]\ntype = \"runtime\"\n...",
-  "default_package": "https://github.com/colinrozzi/tickets/releases/download/release-XXX/tickets.wasm",
-  "listen_addr": "0.0.0.0:8443",
-  "bearer_token": "<shared secret>"
+  "default_package": "https://github.com/colinrozzi/tickets/releases/download/release-XXX/tickets_acceptor.wasm",
+  "listen_addr": "0.0.0.0:8444",
+  "bearer_token": "<shared secret>",
+  "secrets": {
+    "INBOX_TOKEN": "<inbox HTTP API bearer for the child>",
+    "API_TOKEN":   "<the child's own HTTP API token>"
+  }
 }
 ```
 
-The `child_manifest_template` is the child's full `manifest.toml` body with the `package = "..."` line replaced by `package = "__PACKAGE__"`. Sentinel keeps it as a template and substitutes the current package URL in at every spawn. The supervisor never reads a separate file from disk — it composes the manifest TOML in memory and hands it to `supervisor.spawn` (which accepts either a path or inline content).
+The `child_manifest_template` is the child's full `manifest.toml` body with placeholders for any values that vary per deploy:
+
+- `__PACKAGE__` — the wasm artifact URL. Sentinel substitutes `default_package` initially and the `start` command's `package` arg on every subsequent spawn.
+- `__KEY__` for each entry in the `secrets` map — substituted from the value in the map. Use for credentials, API tokens, anything that shouldn't live in the manifest TOML itself or be committed to git.
+
+Sentinel composes the manifest TOML in memory and hands it to `supervisor.spawn` (which accepts either a path or inline content). Secret values live only in sentinel's RAM after init — sentinel never persists them to disk. Substitution order is *all secrets first, then `__PACKAGE__`* — don't reuse `__PACKAGE__` as a literal substring inside a secret value.
+
+Secret values are inserted **verbatim**. If a value contains TOML-special characters (`"`, `\`, etc.) they must be pre-escaped in the JSON config so that the resulting `field = "<value>"` line parses correctly. For hex tokens / random secrets this isn't an issue.
 
 ## Protocol
 
