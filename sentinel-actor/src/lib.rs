@@ -67,6 +67,12 @@ pub struct SentinelState {
     /// Listener handle returned by `tcp.listen` at init.
     pub listener_id: String,
     pub child_id: String,
+    /// Operator-supplied secrets substituted into the manifest template
+    /// at every spawn. Parallel `secret_names`/`secret_values` Vecs of equal
+    /// length — a `{name="API_TOKEN", value="..."}` pair becomes a `__API_TOKEN__`
+    /// placeholder substitution. RAM-only; never written to disk on sentinel's side.
+    pub secret_names: Vec<String>,
+    pub secret_values: Vec<String>,
     /// One line per recorded chain event: "<event_type> <truncated_payload>".
     pub chain: Vec<String>,
     /// True if we've dropped older events from `chain` to stay under the cap.
@@ -156,6 +162,12 @@ struct Config {
     /// Shared secret for the deploy endpoint. Compared byte-for-byte against
     /// each request's `token` field.
     bearer_token: String,
+    /// Optional secret values for substitution into the manifest template.
+    /// `{"API_TOKEN": "..."}` replaces every `__API_TOKEN__` placeholder. Order
+    /// of substitution is deterministic but not topological — secret values
+    /// containing other placeholder names are left as-is on subsequent passes.
+    #[serde(default)]
+    secrets: alloc::collections::BTreeMap<String, String>,
 }
 
 // ============================================================================
@@ -190,6 +202,9 @@ fn init(state: Value) -> Result<(SentinelState, ()), String> {
         cfg.listen_addr, listener_id
     ));
 
+    let (secret_names, secret_values): (Vec<String>, Vec<String>) =
+        cfg.secrets.into_iter().unzip();
+
     let mut state = SentinelState {
         manifest_template: cfg.child_manifest_template,
         current_package: cfg.default_package,
@@ -197,6 +212,8 @@ fn init(state: Value) -> Result<(SentinelState, ()), String> {
         bearer_token: cfg.bearer_token,
         listener_id,
         child_id: String::new(),
+        secret_names,
+        secret_values,
         chain: Vec::new(),
         chain_truncated: false,
         restart_times: Vec::new(),
@@ -570,16 +587,29 @@ fn on_crash(mut state: SentinelState, child_id: &str, reason: &str) -> SentinelS
 }
 
 /// Render the child manifest TOML by substituting the current package URL
-/// into the template, then spawn it. Theater handles https:// fetch + the
-/// `actor.init` autocall internally (see CLAUDE.md "Gotchas" for the pact).
+/// and any configured secrets into the template, then spawn it. Theater
+/// handles https:// fetch + the `actor.init` autocall internally (see
+/// CLAUDE.md "Gotchas" for the pact).
+///
+/// Substitution order: secrets first, then `__PACKAGE__`. A secret value
+/// containing `__PACKAGE__` would therefore *also* get the package
+/// substitution applied to it — which is the right behavior for the
+/// edge case where someone uses the package URL inside a secret-typed
+/// field, but it does mean operators should not pick `__PACKAGE__` as
+/// a literal substring of an otherwise unrelated secret value.
 fn spawn_child(state: &SentinelState) -> Result<String, String> {
-    let manifest_toml = state
-        .manifest_template
-        .replace(PACKAGE_PLACEHOLDER, &state.current_package);
+    let mut manifest_toml = state.manifest_template.clone();
+    for (name, value) in state.secret_names.iter().zip(state.secret_values.iter()) {
+        let placeholder = format!("__{}__", name);
+        manifest_toml = manifest_toml.replace(&placeholder, value);
+    }
+    manifest_toml = manifest_toml.replace(PACKAGE_PLACEHOLDER, &state.current_package);
     let child_id = supervisor_spawn(manifest_toml, None, None)?;
     log(format!(
-        "[sentinel] spawned child {} (package={})",
-        child_id, state.current_package
+        "[sentinel] spawned child {} (package={}, secrets={})",
+        child_id,
+        state.current_package,
+        state.secret_names.len()
     ));
     Ok(child_id)
 }
