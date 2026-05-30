@@ -1,4 +1,4 @@
-//! Sentinel actor — Phase 3.1 multi-actor supervisor with per-child chain rings.
+//! Sentinel actor — Phase 3.2 multi-actor supervisor with per-child chain rings.
 //!
 //! Supervises N child actors registered statically via the operator's JSON
 //! config. Per-child:
@@ -13,10 +13,18 @@
 //!     (`start`/`stop`/`get_chain`) targets a child by `name`. `list`/`health`
 //!     are global.
 //!
-//! Phase 3.1 builds on theater 0.3.18 / theater-handler-supervisor 0.3.12,
-//! where `handle-child-event` now carries `child-id` as the first argument.
-//! Before that release, sentinel ran a single global chain ring that couldn't
-//! attribute events to a specific child.
+//! Phase 3.1 ships per-child chain rings on top of theater 0.3.18 /
+//! theater-handler-supervisor 0.3.12, where `handle-child-event` now carries
+//! `child-id` as the first argument.
+//!
+//! Phase 3.2 bumps packr-guest 0.5.5 → 0.6.0 to match theater 0.3.18's
+//! packr-abi 0.6.0 (the new 0x15 compact-primitive-list node kind would
+//! otherwise hit "failed to convert parameter" on `handle-child-event`'s
+//! `event-data: list<u8>` payload). Phase 3.2 also moves the bearer token
+//! out of state into the content store — when theater logs a wasm error,
+//! it prints the input tuple verbatim, which used to include the bearer
+//! token field of `SentinelState`'s `Value::Record` representation. The
+//! token now lives only in the store under BEARER_TOKEN_LABEL.
 //!
 //! Notification path is intentionally absent — the phase 1 email-on-crash
 //! went through inbox, which is exactly the thing that'd be down when we'd
@@ -63,6 +71,11 @@ const STORE_ID: &str = "sentinel";
 /// of different children don't trample each other because the suffix is the
 /// child's name.
 const CHILD_MANIFEST_LABEL_PREFIX: &str = "child-manifest-";
+/// Stable store label holding the deploy bearer token. Init writes; every
+/// TCP request reads + ct_eq's the inbound `token` field. Held out of
+/// `SentinelState` so it never appears in the `Value::Record` representation
+/// theater prints as part of wasm-error input formatting.
+const BEARER_TOKEN_LABEL: &str = "bearer-token";
 
 // ============================================================================
 // State
@@ -106,13 +119,12 @@ pub struct ChildState {
 pub struct SentinelState {
     /// TCP address sentinel listens on for inbound commands.
     pub listen_addr: String,
-    /// Shared secret required on every inbound command. Compared byte-for-byte.
-    pub bearer_token: String,
     /// Listener handle returned by `tcp.listen` at init.
     pub listener_id: String,
     /// One entry per configured child. Insertion order = config-map iteration
     /// order (BTreeMap, so alphabetical).
     pub children: Vec<ChildState>,
+    // bearer_token intentionally NOT here — see BEARER_TOKEN_LABEL.
 }
 
 pack_types! {
@@ -136,6 +148,8 @@ pack_types! {
         }
         theater:simple/store {
             store-at-label: func(store-id: string, label: string, content: list<u8>) -> result<string, string>,
+            get-by-label: func(store-id: string, label: string) -> result<option<string>, string>,
+            get: func(store-id: string, content-ref: string) -> result<list<u8>, string>,
         }
     }
     exports {
@@ -181,6 +195,12 @@ fn tcp_close(connection_id: String) -> Result<(), String>;
 
 #[import(module = "theater:simple/store", name = "store-at-label")]
 fn store_at_label(store_id: String, label: String, content: Vec<u8>) -> Result<String, String>;
+
+#[import(module = "theater:simple/store", name = "get-by-label")]
+fn store_get_by_label(store_id: String, label: String) -> Result<Option<String>, String>;
+
+#[import(module = "theater:simple/store", name = "get")]
+fn store_get(store_id: String, content_ref: String) -> Result<Vec<u8>, String>;
 
 // ============================================================================
 // Config — what the operator hands us via initial_state
@@ -260,6 +280,17 @@ fn init(state: Value) -> Result<(SentinelState, ()), String> {
         cfg.listen_addr, listener_id
     ));
 
+    // Write bearer token to the content store under a stable label so it
+    // never sits in `SentinelState`. theater logs the wasm input tuple
+    // verbatim on conversion error; keeping the token off the Record means
+    // those error lines no longer leak it.
+    store_at_label(
+        String::from(STORE_ID),
+        String::from(BEARER_TOKEN_LABEL),
+        cfg.bearer_token.into_bytes(),
+    )
+    .map_err(|e| format!("sentinel: failed to persist bearer token: {}", e))?;
+
     let mut children: Vec<ChildState> = cfg
         .children
         .into_iter()
@@ -298,7 +329,6 @@ fn init(state: Value) -> Result<(SentinelState, ()), String> {
     Ok((
         SentinelState {
             listen_addr: cfg.listen_addr,
-            bearer_token: cfg.bearer_token,
             listener_id,
             children,
         },
@@ -503,7 +533,18 @@ fn dispatch_request(state: &mut SentinelState, request_bytes: &[u8]) -> Vec<u8> 
         Ok(r) => r,
         Err(e) => return error_response(&format!("bad request JSON: {}", e)),
     };
-    if !ct_eq(req.token.as_bytes(), state.bearer_token.as_bytes()) {
+    // Bearer token lives in the content store (off `SentinelState`) so it
+    // never appears in wasm-error input formatting. Two store calls per
+    // request (get-by-label → get); fine because TCP volume is operator-
+    // scale, not request-scale.
+    let bearer_bytes = match load_bearer_token() {
+        Ok(b) => b,
+        Err(e) => {
+            log(format!("[sentinel] bearer lookup failed: {}", e));
+            return error_response("internal: bearer unavailable");
+        }
+    };
+    if !ct_eq(req.token.as_bytes(), &bearer_bytes) {
         // Don't leak which header failed; one error for any auth failure.
         return error_response("unauthorized");
     }
@@ -667,6 +708,18 @@ fn error_response(msg: &str) -> Vec<u8> {
         }
         Err(_) => b"{\"ok\":false,\"error\":\"encode failure\"}\n".to_vec(),
     }
+}
+
+/// Read the deploy bearer token from the content store. Two host calls —
+/// resolve label to content-ref, fetch content. Called on every TCP request.
+fn load_bearer_token() -> Result<Vec<u8>, String> {
+    let content_ref = store_get_by_label(
+        String::from(STORE_ID),
+        String::from(BEARER_TOKEN_LABEL),
+    )
+    .map_err(|e| format!("get-by-label: {}", e))?
+    .ok_or_else(|| String::from("bearer token label missing"))?;
+    store_get(String::from(STORE_ID), content_ref).map_err(|e| format!("get: {}", e))
 }
 
 /// Constant-time byte comparison so token-equality leak is bounded by length.

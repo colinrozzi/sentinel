@@ -8,4 +8,4 @@ name = "crashing_child"
 crate-type = ["cdylib"]
 
 [dependencies]
-packr-guest = { version = "0.5.5", features = ["derive"] }
+packr-guest = { version = "0.6.0", features = ["derive"] }
