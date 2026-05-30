@@ -7,6 +7,7 @@ Runs as the top-level process for an actor system. Spawns N configured child act
 ## What works
 
 - Spawns every configured child on init; init hard-fails if any one of them fails to spawn (operator needs to know on day 1)
+- Pre-spawn template validation: init scans each child's `manifest_template` for `__KEY__` placeholders and rejects the config if any KEY has no matching `secrets` entry (and isn't the built-in `__PACKAGE__`). Catches operator typos before the literal placeholder string gets persisted as a child's initial state
 - On `handle-child-error` / `handle-child-exit` for a known child-id: logs a crash summary and respawns *that* child
 - Per-child rate limiter: at most 5 restarts per 60s per child; past that, the affected child is flagged `restart_blocked` and not respawned until either a `start` command for that name lands or the sentinel process restarts. Independent across children — one runaway child can't block another's respawns
 - `handle-child-external-stop` does **not** respawn (intentional shutdown)
