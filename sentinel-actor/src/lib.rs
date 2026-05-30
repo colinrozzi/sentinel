@@ -1,21 +1,22 @@
-//! Sentinel actor — Phase 3 multi-actor supervisor.
+//! Sentinel actor — Phase 3.1 multi-actor supervisor with per-child chain rings.
 //!
 //! Supervises N child actors registered statically via the operator's JSON
 //! config. Per-child:
 //!   - manifest template + current package + secrets (substituted at spawn)
 //!   - theater-assigned child id, refreshed on every respawn
 //!   - independent rate limiter (N restarts / M ms before respawn-blocked)
+//!   - independent chain ring buffer (cap MAX_CHAIN_EVENTS, cleared on crash —
+//!     the contents belong to the child run that just ended)
 //!
 //! Global state:
-//!   - TCP+JSON command surface (bearer-token auth); commands `start`/`stop`
-//!     target a child by `name`. `list`/`health` are global. `get_chain` is
-//!     global today (see note below).
-//!   - One chain ring buffer across all children. theater's
-//!     `handle-child-event` currently lacks a child-id parameter (the other
-//!     three supervisor-handlers — error/exit/external-stop — do carry it),
-//!     so we cannot attribute a chain event to its originating child. A
-//!     theater PR has been requested to add child-id; once it lands, per-
-//!     child chain rings ship as Phase 3.1.
+//!   - TCP+JSON command surface (bearer-token auth); every per-child command
+//!     (`start`/`stop`/`get_chain`) targets a child by `name`. `list`/`health`
+//!     are global.
+//!
+//! Phase 3.1 builds on theater 0.3.18 / theater-handler-supervisor 0.3.12,
+//! where `handle-child-event` now carries `child-id` as the first argument.
+//! Before that release, sentinel ran a single global chain ring that couldn't
+//! attribute events to a specific child.
 //!
 //! Notification path is intentionally absent — the phase 1 email-on-crash
 //! went through inbox, which is exactly the thing that'd be down when we'd
@@ -86,6 +87,12 @@ pub struct ChildState {
     /// theater-assigned child id from the most recent successful spawn.
     /// Empty until init's first spawn lands.
     pub child_id: String,
+    /// Per-child chain ring buffer — one line per chain event,
+    /// "<event_type> <truncated_payload>". Bounded at MAX_CHAIN_EVENTS;
+    /// oldest dropped past cap with `chain_truncated` set. Reset after every
+    /// crash — the contents belonged to the run that just ended.
+    pub chain: Vec<String>,
+    pub chain_truncated: bool,
     /// Recent restart timestamps in ms-since-epoch. Trimmed to the
     /// RATE_LIMIT_M_MS window before each rate-limit check.
     pub restart_times: Vec<u64>,
@@ -106,13 +113,6 @@ pub struct SentinelState {
     /// One entry per configured child. Insertion order = config-map iteration
     /// order (BTreeMap, so alphabetical).
     pub children: Vec<ChildState>,
-    /// Global chain ring across all children — one line per chain event,
-    /// "<event_type> <truncated_payload>". theater's `handle-child-event`
-    /// doesn't yet carry child-id, so we can't filter by child without a
-    /// theater-side change. Bounded at MAX_CHAIN_EVENTS; oldest dropped.
-    pub chain: Vec<String>,
-    /// True if we've dropped older events from `chain` to stay under the cap.
-    pub chain_truncated: bool,
 }
 
 pack_types! {
@@ -143,7 +143,7 @@ pack_types! {
         theater:simple/supervisor-handlers.handle-child-error: func(state: sentinel-state, child-id: string, error: value) -> result<sentinel-state, string>,
         theater:simple/supervisor-handlers.handle-child-exit: func(state: sentinel-state, child-id: string, result: value) -> result<sentinel-state, string>,
         theater:simple/supervisor-handlers.handle-child-external-stop: func(state: sentinel-state, child-id: string) -> result<sentinel-state, string>,
-        theater:simple/supervisor-handlers.handle-child-event: func(state: sentinel-state, event-type: string, event-data: list<u8>) -> result<sentinel-state, string>,
+        theater:simple/supervisor-handlers.handle-child-event: func(state: sentinel-state, child-id: string, event-type: string, event-data: list<u8>) -> result<sentinel-state, string>,
         theater:simple/tcp-client.handle-connection: func(state: sentinel-state, connection-id: string) -> result<sentinel-state, string>,
     }
 }
@@ -273,6 +273,8 @@ fn init(state: Value) -> Result<(SentinelState, ()), String> {
                 secret_names,
                 secret_values,
                 child_id: String::new(),
+                chain: Vec::new(),
+                chain_truncated: false,
                 restart_times: Vec::new(),
                 restart_blocked: false,
             }
@@ -299,8 +301,6 @@ fn init(state: Value) -> Result<(SentinelState, ()), String> {
             bearer_token: cfg.bearer_token,
             listener_id,
             children,
-            chain: Vec::new(),
-            chain_truncated: false,
         },
         (),
     ))
@@ -309,16 +309,31 @@ fn init(state: Value) -> Result<(SentinelState, ()), String> {
 #[export(name = "theater:simple/supervisor-handlers.handle-child-event")]
 fn handle_child_event(
     state: SentinelState,
+    child_id: String,
     event_type: String,
     event_data: Vec<u8>,
 ) -> Result<(SentinelState, ()), String> {
     let mut state = state;
+    let idx = match state.children.iter().position(|c| c.child_id == child_id) {
+        Some(i) => i,
+        None => {
+            // Stale event during respawn, or an event for a child theater
+            // tracks but we don't (shouldn't happen — static registration).
+            // Log + drop; don't accumulate unattributable events.
+            log(format!(
+                "[sentinel] chain event for unknown child_id={} type={} — ignoring",
+                child_id, event_type
+            ));
+            return Ok((state, ()));
+        }
+    };
     let payload = summarize_payload(&event_data);
-    state.chain.push(format!("{} {}", event_type, payload));
-    if state.chain.len() > MAX_CHAIN_EVENTS {
-        let drop = state.chain.len() - MAX_CHAIN_EVENTS;
-        state.chain.drain(0..drop);
-        state.chain_truncated = true;
+    let child = &mut state.children[idx];
+    child.chain.push(format!("{} {}", event_type, payload));
+    if child.chain.len() > MAX_CHAIN_EVENTS {
+        let drop = child.chain.len() - MAX_CHAIN_EVENTS;
+        child.chain.drain(0..drop);
+        child.chain_truncated = true;
     }
     Ok((state, ()))
 }
@@ -376,8 +391,6 @@ struct Request {
 struct HealthResp<'a> {
     ok: bool,
     listen_addr: &'a str,
-    chain_size: usize,
-    chain_truncated: bool,
     children: Vec<HealthChild<'a>>,
 }
 
@@ -388,6 +401,8 @@ struct HealthChild<'a> {
     restart_blocked: bool,
     recent_restarts: usize,
     current_package: &'a str,
+    chain_size: usize,
+    chain_truncated: bool,
 }
 
 #[derive(Serialize)]
@@ -495,7 +510,7 @@ fn dispatch_request(state: &mut SentinelState, request_bytes: &[u8]) -> Vec<u8> 
     match req.cmd.as_str() {
         "health" => cmd_health(state),
         "list" => cmd_list(state),
-        "get_chain" => cmd_get_chain(state),
+        "get_chain" => cmd_get_chain(state, req.name),
         "start" => cmd_start(state, req.name, req.package),
         "stop" => cmd_stop(state, req.name),
         other => error_response(&format!("unknown cmd: {}", other)),
@@ -519,14 +534,14 @@ fn cmd_health(state: &SentinelState) -> Vec<u8> {
                 restart_blocked: c.restart_blocked,
                 recent_restarts: recent,
                 current_package: &c.current_package,
+                chain_size: c.chain.len(),
+                chain_truncated: c.chain_truncated,
             }
         })
         .collect();
     encode(&HealthResp {
         ok: true,
         listen_addr: &state.listen_addr,
-        chain_size: state.chain.len(),
-        chain_truncated: state.chain_truncated,
         children,
     })
 }
@@ -545,14 +560,18 @@ fn cmd_list(state: &SentinelState) -> Vec<u8> {
     encode(&ListResp { ok: true, children })
 }
 
-fn cmd_get_chain(state: &SentinelState) -> Vec<u8> {
-    // Global chain ring (Phase 3 limitation — see module docs). When theater's
-    // handle-child-event grows a child-id parameter, Phase 3.1 will accept a
-    // `name` field here and filter to that child's events.
+fn cmd_get_chain(state: &SentinelState, name: Option<String>) -> Vec<u8> {
+    let Some(name) = name else {
+        return error_response("get_chain requires `name` field");
+    };
+    let child = match state.children.iter().find(|c| c.name == name) {
+        Some(c) => c,
+        None => return error_response(&format!("unknown child name: {}", name)),
+    };
     encode(&GetChainResp {
         ok: true,
-        chain: &state.chain,
-        chain_truncated: state.chain_truncated,
+        chain: &child.chain,
+        chain_truncated: child.chain_truncated,
     })
 }
 
@@ -581,6 +600,10 @@ fn cmd_start(
     // even when the operator has fixed the underlying issue.
     child.restart_blocked = false;
     child.restart_times.clear();
+    // The old chain belongs to the previous run; clear it so the new run
+    // starts with a fresh buffer (parallel to on_crash's reset).
+    child.chain.clear();
+    child.chain_truncated = false;
 
     // Stop the current child if it's still alive. Tolerate stop failure
     // (already dead, etc.) — external-stop is a no-op so no unwanted respawn.
@@ -680,12 +703,6 @@ fn on_crash(mut state: SentinelState, child_id: &str, reason: &str) -> SentinelS
         }
     };
 
-    // Snapshot chain summary before mutably borrowing the child slot — the
-    // global chain is shared across all children and not cleared on per-child
-    // crash (doing so would drop healthy-child events).
-    let chain_size = state.chain.len();
-    let chain_truncated = state.chain_truncated;
-
     let child = &mut state.children[idx];
     child
         .restart_times
@@ -698,10 +715,15 @@ fn on_crash(mut state: SentinelState, child_id: &str, reason: &str) -> SentinelS
         child_id,
         reason,
         now_ms,
-        chain_size,
-        if chain_truncated { " (TRUNCATED)" } else { "" },
+        child.chain.len(),
+        if child.chain_truncated { " (TRUNCATED)" } else { "" },
         recent,
     ));
+
+    // The chain snapshot belongs to the run that just ended — drop it before
+    // the next spawn so the new run starts with a clean buffer.
+    child.chain.clear();
+    child.chain_truncated = false;
 
     if child.restart_blocked {
         log(format!(
