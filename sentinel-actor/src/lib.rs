@@ -1,30 +1,30 @@
-//! Sentinel actor.
+//! Sentinel actor — Phase 3 multi-actor supervisor.
 //!
-//! Phase 1 (existing): supervises one child actor. Accumulates a per-event
-//! chain summary in memory; on child error / exit, logs a crash line and
-//! respawns (subject to a crash-loop rate limiter). An external stop never
-//! respawns.
+//! Supervises N child actors registered statically via the operator's JSON
+//! config. Per-child:
+//!   - manifest template + current package + secrets (substituted at spawn)
+//!   - theater-assigned child id, refreshed on every respawn
+//!   - independent rate limiter (N restarts / M ms before respawn-blocked)
 //!
-//! Phase 2 (new): exposes a bearer-token-authenticated TCP+JSON command
-//! surface (start, stop, list, get_chain, health) for managing the supervised
-//! child. The child's manifest is held in memory as a template with a
-//! `__PACKAGE__` placeholder; "start" swaps the package URL/path and respawns.
+//! Global state:
+//!   - TCP+JSON command surface (bearer-token auth); commands `start`/`stop`
+//!     target a child by `name`. `list`/`health` are global. `get_chain` is
+//!     global today (see note below).
+//!   - One chain ring buffer across all children. theater's
+//!     `handle-child-event` currently lacks a child-id parameter (the other
+//!     three supervisor-handlers — error/exit/external-stop — do carry it),
+//!     so we cannot attribute a chain event to its originating child. A
+//!     theater PR has been requested to add child-id; once it lands, per-
+//!     child chain rings ship as Phase 3.1.
 //!
-//! The rendered child manifest TOML is written to sentinel's own content store
-//! (label `child-manifest-current`) at every spawn and theater is handed a
-//! `store://sentinel/child-manifest-current` URI. theater's resolve_reference
-//! supports only store://, http(s)://, and bare-filesystem-paths — inline
-//! manifest content is not supported, so the store hop is mandatory.
-//!
-//! Notification is intentionally absent right now — the original phase 1
-//! email-on-crash path went through the inbox, which is exactly what
-//! sentinel-supervises-inbox would have down at the moment we'd want to
-//! notify. Circular bootstrap dependency. See CLAUDE.md "Deferred" for the
-//! design space.
+//! Notification path is intentionally absent — the phase 1 email-on-crash
+//! went through inbox, which is exactly the thing that'd be down when we'd
+//! want to notify. See CLAUDE.md "Deferred" for the design space.
 
 #![no_std]
 extern crate alloc;
 
+use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -41,7 +41,9 @@ packr_guest::setup_guest!();
 const MAX_CHAIN_EVENTS: usize = 500;
 /// Per-event payload bytes summarized in the chain entry. Keeps lines tight.
 const MAX_EVENT_PAYLOAD_BYTES: usize = 256;
-/// Crash-loop window: at most N restarts in M ms before we give up.
+/// Crash-loop window: at most N restarts in M ms per child before we give up
+/// on that child specifically (rate-limiter is per-child — a runaway one
+/// child can't block another's respawns).
 const RATE_LIMIT_N: usize = 5;
 const RATE_LIMIT_M_MS: u64 = 60_000;
 
@@ -49,15 +51,17 @@ const RATE_LIMIT_M_MS: u64 = 60_000;
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 /// Per-call tcp.receive cap. We loop until newline / EOF / MAX_REQUEST_BYTES.
 const RECV_CHUNK: u32 = 4096;
-/// Placeholder substituted with the current package URL when rendering the
+/// Placeholder substituted with the current package URL when rendering a
 /// child manifest TOML at spawn time.
 const PACKAGE_PLACEHOLDER: &str = "__PACKAGE__";
 /// Content-store ID that sentinel's manifest declares — must match
 /// sentinel-actor/manifest.toml's `[[handler]] type = "store"` `store_id`.
 const STORE_ID: &str = "sentinel";
-/// Stable label under which sentinel writes the rendered child manifest TOML
-/// before handing theater a `store://` URI. Overwritten on each spawn.
-const CHILD_MANIFEST_LABEL: &str = "child-manifest-current";
+/// Per-child label prefix under which sentinel writes each rendered child
+/// manifest TOML before handing theater a `store://` URI. Concurrent spawns
+/// of different children don't trample each other because the suffix is the
+/// child's name.
+const CHILD_MANIFEST_LABEL_PREFIX: &str = "child-manifest-";
 
 // ============================================================================
 // State
@@ -65,37 +69,50 @@ const CHILD_MANIFEST_LABEL: &str = "child-manifest-current";
 
 #[derive(Clone, GraphValue)]
 #[graph(crate = "packr_guest::composite_abi")]
-pub struct SentinelState {
-    /// Child manifest TOML body containing PACKAGE_PLACEHOLDER. Sentinel
-    /// substitutes the current_package URL into this template at every spawn.
+pub struct ChildState {
+    /// Operator-supplied stable handle for this child. TCP commands target
+    /// children by name; theater's child-id is opaque and rotates on respawn.
+    pub name: String,
+    /// Child manifest TOML body with PACKAGE_PLACEHOLDER and `__SECRET__`
+    /// placeholders. Sentinel substitutes both at every spawn.
     pub manifest_template: String,
-    /// The package URL / path that supervises.spawn should resolve. Mutated
-    /// by the `start` command.
+    /// The package URL / path that supervisor.spawn should resolve next.
+    /// Mutated by the `start` command.
     pub current_package: String,
+    /// Parallel name/value vectors for the secrets map. Indexed pair-wise.
+    /// RAM-only — never written to disk on sentinel's side.
+    pub secret_names: Vec<String>,
+    pub secret_values: Vec<String>,
+    /// theater-assigned child id from the most recent successful spawn.
+    /// Empty until init's first spawn lands.
+    pub child_id: String,
+    /// Recent restart timestamps in ms-since-epoch. Trimmed to the
+    /// RATE_LIMIT_M_MS window before each rate-limit check.
+    pub restart_times: Vec<u64>,
+    /// True once the per-child rate limiter has tripped. A successful `start`
+    /// command for this child clears it.
+    pub restart_blocked: bool,
+}
+
+#[derive(Clone, GraphValue)]
+#[graph(crate = "packr_guest::composite_abi")]
+pub struct SentinelState {
     /// TCP address sentinel listens on for inbound commands.
     pub listen_addr: String,
     /// Shared secret required on every inbound command. Compared byte-for-byte.
     pub bearer_token: String,
     /// Listener handle returned by `tcp.listen` at init.
     pub listener_id: String,
-    pub child_id: String,
-    /// Operator-supplied secrets substituted into the manifest template
-    /// at every spawn. Parallel `secret_names`/`secret_values` Vecs of equal
-    /// length — a `{name="API_TOKEN", value="..."}` pair becomes a `__API_TOKEN__`
-    /// placeholder substitution. RAM-only; never written to disk on sentinel's side.
-    pub secret_names: Vec<String>,
-    pub secret_values: Vec<String>,
-    /// One line per recorded chain event: "<event_type> <truncated_payload>".
+    /// One entry per configured child. Insertion order = config-map iteration
+    /// order (BTreeMap, so alphabetical).
+    pub children: Vec<ChildState>,
+    /// Global chain ring across all children — one line per chain event,
+    /// "<event_type> <truncated_payload>". theater's `handle-child-event`
+    /// doesn't yet carry child-id, so we can't filter by child without a
+    /// theater-side change. Bounded at MAX_CHAIN_EVENTS; oldest dropped.
     pub chain: Vec<String>,
     /// True if we've dropped older events from `chain` to stay under the cap.
     pub chain_truncated: bool,
-    /// Recent restart timestamps in ms-since-epoch; old entries trimmed before
-    /// the rate-limit check.
-    pub restart_times: Vec<u64>,
-    /// Once true, the rate limiter has fired and we no longer respawn.
-    /// Operator intervention required to unblock (`start` command or restart
-    /// the sentinel process).
-    pub restart_blocked: bool,
 }
 
 pack_types! {
@@ -170,22 +187,31 @@ fn store_at_label(store_id: String, label: String, content: Vec<u8>) -> Result<S
 // ============================================================================
 
 #[derive(Deserialize)]
-struct Config {
-    /// Child manifest TOML body with `__PACKAGE__` placeholder for the package URL.
-    child_manifest_template: String,
-    /// Initial package URL or path that fills the placeholder until `start` rewrites it.
+struct ChildCfg {
+    /// Child manifest TOML body with `__PACKAGE__` placeholder + any `__KEY__`
+    /// placeholders for secrets.
+    manifest_template: String,
+    /// Initial package URL or path that fills `__PACKAGE__` until a `start`
+    /// command rewrites it.
     default_package: String,
-    /// TCP listen address, e.g. "0.0.0.0:8443".
+    /// Optional secret values for substitution. `{"API_TOKEN": "..."}` replaces
+    /// every `__API_TOKEN__` placeholder. Substitution is deterministic but
+    /// not topological — secret values containing other placeholder names are
+    /// left as-is on subsequent passes.
+    #[serde(default)]
+    secrets: BTreeMap<String, String>,
+}
+
+#[derive(Deserialize)]
+struct Config {
+    /// TCP listen address, e.g. "0.0.0.0:8444".
     listen_addr: String,
     /// Shared secret for the deploy endpoint. Compared byte-for-byte against
     /// each request's `token` field.
     bearer_token: String,
-    /// Optional secret values for substitution into the manifest template.
-    /// `{"API_TOKEN": "..."}` replaces every `__API_TOKEN__` placeholder. Order
-    /// of substitution is deterministic but not topological — secret values
-    /// containing other placeholder names are left as-is on subsequent passes.
-    #[serde(default)]
-    secrets: alloc::collections::BTreeMap<String, String>,
+    /// Children to supervise, keyed by operator-chosen name. Names appear in
+    /// TCP requests (`start`/`stop` target by name) and in log lines.
+    children: BTreeMap<String, ChildCfg>,
 }
 
 // ============================================================================
@@ -203,14 +229,28 @@ fn init(state: Value) -> Result<(SentinelState, ()), String> {
     let cfg: Config = serde_json::from_str(&raw)
         .map_err(|e| format!("sentinel: bad initial_state JSON: {}", e))?;
 
-    if !cfg.child_manifest_template.contains(PACKAGE_PLACEHOLDER) {
-        return Err(format!(
-            "sentinel: child_manifest_template must contain placeholder {}",
-            PACKAGE_PLACEHOLDER
-        ));
-    }
     if cfg.bearer_token.is_empty() {
         return Err(String::from("sentinel: bearer_token must be non-empty"));
+    }
+    if cfg.children.is_empty() {
+        return Err(String::from("sentinel: children map must be non-empty"));
+    }
+    for (name, child) in &cfg.children {
+        if name.is_empty() {
+            return Err(String::from("sentinel: child name must be non-empty"));
+        }
+        if !child.manifest_template.contains(PACKAGE_PLACEHOLDER) {
+            return Err(format!(
+                "sentinel: child '{}' manifest_template must contain placeholder {}",
+                name, PACKAGE_PLACEHOLDER
+            ));
+        }
+        if child.default_package.is_empty() {
+            return Err(format!(
+                "sentinel: child '{}' default_package must be non-empty",
+                name
+            ));
+        }
     }
 
     let listener_id = tcp_listen(cfg.listen_addr.clone())
@@ -220,29 +260,50 @@ fn init(state: Value) -> Result<(SentinelState, ()), String> {
         cfg.listen_addr, listener_id
     ));
 
-    let (secret_names, secret_values): (Vec<String>, Vec<String>) =
-        cfg.secrets.into_iter().unzip();
+    let mut children: Vec<ChildState> = cfg
+        .children
+        .into_iter()
+        .map(|(name, child_cfg)| {
+            let (secret_names, secret_values): (Vec<String>, Vec<String>) =
+                child_cfg.secrets.into_iter().unzip();
+            ChildState {
+                name,
+                manifest_template: child_cfg.manifest_template,
+                current_package: child_cfg.default_package,
+                secret_names,
+                secret_values,
+                child_id: String::new(),
+                restart_times: Vec::new(),
+                restart_blocked: false,
+            }
+        })
+        .collect();
 
-    let mut state = SentinelState {
-        manifest_template: cfg.child_manifest_template,
-        current_package: cfg.default_package,
-        listen_addr: cfg.listen_addr,
-        bearer_token: cfg.bearer_token,
-        listener_id,
-        child_id: String::new(),
-        secret_names,
-        secret_values,
-        chain: Vec::new(),
-        chain_truncated: false,
-        restart_times: Vec::new(),
-        restart_blocked: false,
-    };
+    // Hard-fail init if any configured child fails to spawn — operator needs
+    // to know immediately if a child's manifest or package URL is broken.
+    for child in children.iter_mut() {
+        match spawn_child(child) {
+            Ok(child_id) => child.child_id = child_id,
+            Err(e) => {
+                return Err(format!(
+                    "sentinel: spawn child '{}' failed: {}",
+                    child.name, e
+                ));
+            }
+        }
+    }
 
-    let child_id = spawn_child(&state)
-        .map_err(|e| format!("sentinel: spawn child failed: {}", e))?;
-    state.child_id = child_id;
-
-    Ok((state, ()))
+    Ok((
+        SentinelState {
+            listen_addr: cfg.listen_addr,
+            bearer_token: cfg.bearer_token,
+            listener_id,
+            children,
+            chain: Vec::new(),
+            chain_truncated: false,
+        },
+        (),
+    ))
 }
 
 #[export(name = "theater:simple/supervisor-handlers.handle-child-event")]
@@ -302,8 +363,11 @@ fn handle_child_external_stop(
 struct Request {
     token: String,
     cmd: String,
-    /// Used by `start`. The new package URL/path; the manifest template gets
-    /// rendered with this value before the spawn.
+    /// Used by `start`/`stop`. The operator-chosen child name.
+    #[serde(default)]
+    name: Option<String>,
+    /// Used by `start`. The new package URL/path; the named child's manifest
+    /// template gets rendered with this value before the spawn.
     #[serde(default)]
     package: Option<String>,
 }
@@ -311,19 +375,33 @@ struct Request {
 #[derive(Serialize)]
 struct HealthResp<'a> {
     ok: bool,
+    listen_addr: &'a str,
+    chain_size: usize,
+    chain_truncated: bool,
+    children: Vec<HealthChild<'a>>,
+}
+
+#[derive(Serialize)]
+struct HealthChild<'a> {
+    name: &'a str,
     child_id: &'a str,
     restart_blocked: bool,
     recent_restarts: usize,
-    chain_size: usize,
-    chain_truncated: bool,
-    listen_addr: &'a str,
+    current_package: &'a str,
 }
 
 #[derive(Serialize)]
 struct ListResp<'a> {
     ok: bool,
+    children: Vec<ListChild<'a>>,
+}
+
+#[derive(Serialize)]
+struct ListChild<'a> {
+    name: &'a str,
     child_id: &'a str,
     current_package: &'a str,
+    restart_blocked: bool,
 }
 
 #[derive(Serialize)]
@@ -336,6 +414,7 @@ struct GetChainResp<'a> {
 #[derive(Serialize)]
 struct StartResp<'a> {
     ok: bool,
+    name: &'a str,
     child_id: &'a str,
     current_package: &'a str,
 }
@@ -343,6 +422,7 @@ struct StartResp<'a> {
 #[derive(Serialize)]
 struct StopResp<'a> {
     ok: bool,
+    name: &'a str,
     stopped_child_id: &'a str,
 }
 
@@ -372,14 +452,11 @@ fn handle_connection(
 
 fn handle_connection_inner(state: &mut SentinelState, conn_id: &str) -> Result<(), String> {
     // accept() returned a PENDING connection per tcp.pact — activate it first.
-    tcp_activate(conn_id.to_string())
-        .map_err(|e| format!("activate: {}", e))?;
+    tcp_activate(conn_id.to_string()).map_err(|e| format!("activate: {}", e))?;
     let request_bytes = receive_line(conn_id)?;
     let response_bytes = dispatch_request(state, &request_bytes);
-    tcp_send(conn_id.to_string(), response_bytes)
-        .map_err(|e| format!("send: {}", e))?;
-    tcp_close(conn_id.to_string())
-        .map_err(|e| format!("close: {}", e))?;
+    tcp_send(conn_id.to_string(), response_bytes).map_err(|e| format!("send: {}", e))?;
+    tcp_close(conn_id.to_string()).map_err(|e| format!("close: {}", e))?;
     Ok(())
 }
 
@@ -389,8 +466,8 @@ fn receive_line(conn_id: &str) -> Result<Vec<u8>, String> {
         if buf.len() >= MAX_REQUEST_BYTES {
             return Err(format!("request exceeds {} bytes", MAX_REQUEST_BYTES));
         }
-        let chunk = tcp_receive(conn_id.to_string(), RECV_CHUNK)
-            .map_err(|e| format!("receive: {}", e))?;
+        let chunk =
+            tcp_receive(conn_id.to_string(), RECV_CHUNK).map_err(|e| format!("receive: {}", e))?;
         if chunk.is_empty() {
             // EOF from peer.
             break;
@@ -419,39 +496,59 @@ fn dispatch_request(state: &mut SentinelState, request_bytes: &[u8]) -> Vec<u8> 
         "health" => cmd_health(state),
         "list" => cmd_list(state),
         "get_chain" => cmd_get_chain(state),
-        "start" => cmd_start(state, req.package),
-        "stop" => cmd_stop(state),
+        "start" => cmd_start(state, req.name, req.package),
+        "stop" => cmd_stop(state, req.name),
         other => error_response(&format!("unknown cmd: {}", other)),
     }
 }
 
 fn cmd_health(state: &SentinelState) -> Vec<u8> {
     let now_ms = timer_now();
-    let recent = state
-        .restart_times
+    let children: Vec<HealthChild> = state
+        .children
         .iter()
-        .filter(|t| now_ms.saturating_sub(**t) <= RATE_LIMIT_M_MS)
-        .count();
+        .map(|c| {
+            let recent = c
+                .restart_times
+                .iter()
+                .filter(|t| now_ms.saturating_sub(**t) <= RATE_LIMIT_M_MS)
+                .count();
+            HealthChild {
+                name: &c.name,
+                child_id: &c.child_id,
+                restart_blocked: c.restart_blocked,
+                recent_restarts: recent,
+                current_package: &c.current_package,
+            }
+        })
+        .collect();
     encode(&HealthResp {
         ok: true,
-        child_id: &state.child_id,
-        restart_blocked: state.restart_blocked,
-        recent_restarts: recent,
+        listen_addr: &state.listen_addr,
         chain_size: state.chain.len(),
         chain_truncated: state.chain_truncated,
-        listen_addr: &state.listen_addr,
+        children,
     })
 }
 
 fn cmd_list(state: &SentinelState) -> Vec<u8> {
-    encode(&ListResp {
-        ok: true,
-        child_id: &state.child_id,
-        current_package: &state.current_package,
-    })
+    let children: Vec<ListChild> = state
+        .children
+        .iter()
+        .map(|c| ListChild {
+            name: &c.name,
+            child_id: &c.child_id,
+            current_package: &c.current_package,
+            restart_blocked: c.restart_blocked,
+        })
+        .collect();
+    encode(&ListResp { ok: true, children })
 }
 
 fn cmd_get_chain(state: &SentinelState) -> Vec<u8> {
+    // Global chain ring (Phase 3 limitation — see module docs). When theater's
+    // handle-child-event grows a child-id parameter, Phase 3.1 will accept a
+    // `name` field here and filter to that child's events.
     encode(&GetChainResp {
         ok: true,
         chain: &state.chain,
@@ -459,53 +556,71 @@ fn cmd_get_chain(state: &SentinelState) -> Vec<u8> {
     })
 }
 
-fn cmd_start(state: &mut SentinelState, package: Option<String>) -> Vec<u8> {
+fn cmd_start(
+    state: &mut SentinelState,
+    name: Option<String>,
+    package: Option<String>,
+) -> Vec<u8> {
+    let Some(name) = name else {
+        return error_response("start requires `name` field");
+    };
     let Some(new_package) = package else {
         return error_response("start requires `package` field");
     };
     if new_package.is_empty() {
         return error_response("start `package` must be non-empty");
     }
+    let idx = match state.children.iter().position(|c| c.name == name) {
+        Some(i) => i,
+        None => return error_response(&format!("unknown child name: {}", name)),
+    };
+    let child = &mut state.children[idx];
 
-    // Operator intent: a `start` resets the crash-loop block. Without this
-    // a recovered child could never come up after the limiter trips, even
-    // when the operator has fixed the underlying issue.
-    state.restart_blocked = false;
-    state.restart_times.clear();
+    // Operator intent: `start` resets the per-child crash-loop block. Without
+    // this a recovered child could never come up after the limiter trips,
+    // even when the operator has fixed the underlying issue.
+    child.restart_blocked = false;
+    child.restart_times.clear();
 
-    // Stop the current child if it's still alive. We tolerate stop failure
-    // (it may already be dead from a prior crash). External-stop handler
-    // is a no-op so this won't trigger an unwanted respawn.
-    if !state.child_id.is_empty() {
-        let _ = supervisor_stop_child(state.child_id.clone());
+    // Stop the current child if it's still alive. Tolerate stop failure
+    // (already dead, etc.) — external-stop is a no-op so no unwanted respawn.
+    if !child.child_id.is_empty() {
+        let _ = supervisor_stop_child(child.child_id.clone());
     }
 
-    state.current_package = new_package;
-    match spawn_child(state) {
+    child.current_package = new_package;
+    match spawn_child(child) {
         Ok(new_id) => {
-            state.child_id = new_id.clone();
-            state.chain.clear();
-            state.chain_truncated = false;
+            child.child_id = new_id;
             encode(&StartResp {
                 ok: true,
-                child_id: &state.child_id,
-                current_package: &state.current_package,
+                name: &child.name,
+                child_id: &child.child_id,
+                current_package: &child.current_package,
             })
         }
         Err(e) => error_response(&format!("spawn failed: {}", e)),
     }
 }
 
-fn cmd_stop(state: &mut SentinelState) -> Vec<u8> {
-    if state.child_id.is_empty() {
-        return error_response("no child to stop");
+fn cmd_stop(state: &mut SentinelState, name: Option<String>) -> Vec<u8> {
+    let Some(name) = name else {
+        return error_response("stop requires `name` field");
+    };
+    let child = match state.children.iter().find(|c| c.name == name) {
+        Some(c) => c,
+        None => return error_response(&format!("unknown child name: {}", name)),
+    };
+    if child.child_id.is_empty() {
+        return error_response("no child running for that name");
     }
-    let stopped = state.child_id.clone();
+    let stopped = child.child_id.clone();
     if let Err(e) = supervisor_stop_child(stopped.clone()) {
         return error_response(&format!("stop failed: {}", e));
     }
     encode(&StopResp {
         ok: true,
+        name: &child.name,
         stopped_child_id: &stopped,
     })
 }
@@ -547,99 +662,115 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 // Crash handling
 // ============================================================================
 
-/// Common crash path for error + exit. Logs a summary, runs the rate limiter,
-/// respawns (or marks the child blocked), and resets the chain buffer.
+/// Common crash path for error + exit. Looks up the ChildState that owned the
+/// crashed child-id, applies the per-child rate limiter, respawns it
+/// (or flags it `restart_blocked`). A crash event for an unknown id (most
+/// likely a stale event during respawn) is logged and ignored.
 fn on_crash(mut state: SentinelState, child_id: &str, reason: &str) -> SentinelState {
     let now_ms = timer_now();
-    state
+
+    let idx = match state.children.iter().position(|c| c.child_id == child_id) {
+        Some(i) => i,
+        None => {
+            log(format!(
+                "[sentinel] crash for unknown child_id={} reason={} — ignoring",
+                child_id, reason
+            ));
+            return state;
+        }
+    };
+
+    // Snapshot chain summary before mutably borrowing the child slot — the
+    // global chain is shared across all children and not cleared on per-child
+    // crash (doing so would drop healthy-child events).
+    let chain_size = state.chain.len();
+    let chain_truncated = state.chain_truncated;
+
+    let child = &mut state.children[idx];
+    child
         .restart_times
         .retain(|t| now_ms.saturating_sub(*t) <= RATE_LIMIT_M_MS);
-    let recent = state.restart_times.len();
+    let recent = child.restart_times.len();
 
     log(format!(
-        "[sentinel] crash child={} reason={} t_ms={} chain_size={}{} recent_restarts={}",
+        "[sentinel] crash name={} child={} reason={} t_ms={} chain_size={}{} recent_restarts={}",
+        child.name,
         child_id,
         reason,
         now_ms,
-        state.chain.len(),
-        if state.chain_truncated { " (TRUNCATED)" } else { "" },
+        chain_size,
+        if chain_truncated { " (TRUNCATED)" } else { "" },
         recent,
     ));
 
-    // Reset the chain — this snapshot belongs to the run that just ended.
-    state.chain.clear();
-    state.chain_truncated = false;
-
-    if state.restart_blocked {
+    if child.restart_blocked {
         log(format!(
-            "[sentinel] {} crashed while already in blocked state — not respawning",
-            child_id
+            "[sentinel] {} ({}): crashed while already in blocked state — not respawning",
+            child.name, child_id
         ));
         return state;
     }
     if recent >= RATE_LIMIT_N {
         log(format!(
-            "[sentinel] crash loop ({} crashes in {}ms) — not respawning {}",
+            "[sentinel] crash loop on {} ({} crashes in {}ms) — not respawning",
+            child.name,
             recent + 1,
             RATE_LIMIT_M_MS,
-            child_id,
         ));
-        state.restart_blocked = true;
+        child.restart_blocked = true;
         return state;
     }
 
-    state.restart_times.push(now_ms);
-    match spawn_child(&state) {
+    child.restart_times.push(now_ms);
+    match spawn_child(child) {
         Ok(new_id) => {
-            state.child_id = new_id;
+            child.child_id = new_id;
         }
         Err(e) => {
             // Treat spawn failure as another crash — but we can't recurse into
-            // on_crash without risking infinite loops, so just log and leave
-            // state.child_id pointing at the dead one. Next crash event will
-            // re-enter on_crash and try again.
-            log(format!("[sentinel] respawn failed: {}", e));
+            // on_crash without risking infinite loops. Log and leave child_id
+            // pointing at the dead one; the next crash event re-enters and
+            // tries again.
+            log(format!("[sentinel] respawn {} failed: {}", child.name, e));
         }
     }
     state
 }
 
-/// Render the child manifest TOML by substituting the current package URL
-/// and any configured secrets into the template, write it to sentinel's
-/// content store, and hand theater a `store://` URI. theater's
-/// resolve_reference (crates/theater/src/utils/mod.rs) only understands
-/// store:// / http(s):// / filesystem-path — there is no inline-content
-/// support, so the rendered TOML *must* be written somewhere theater can
-/// fetch it. Sentinel's own store is the cheapest landing pad.
+/// Render the child manifest TOML by substituting any configured secrets and
+/// the current package URL into the template, write it to sentinel's content
+/// store under a per-child label, and hand theater a `store://` URI.
+/// theater's resolve_reference only understands store:// / http(s):// / a
+/// bare filesystem path — there is no inline-content support.
 ///
 /// Substitution order: secrets first, then `__PACKAGE__`. A secret value
-/// containing `__PACKAGE__` would therefore *also* get the package
-/// substitution applied to it — which is the right behavior for the
-/// edge case where someone uses the package URL inside a secret-typed
-/// field, but it does mean operators should not pick `__PACKAGE__` as
-/// a literal substring of an otherwise unrelated secret value.
-fn spawn_child(state: &SentinelState) -> Result<String, String> {
-    let mut manifest_toml = state.manifest_template.clone();
-    for (name, value) in state.secret_names.iter().zip(state.secret_values.iter()) {
+/// containing `__PACKAGE__` would therefore also get the package
+/// substitution applied — operators should not pick `__PACKAGE__` as a
+/// literal substring of an unrelated secret value.
+fn spawn_child(child: &ChildState) -> Result<String, String> {
+    let mut manifest_toml = child.manifest_template.clone();
+    for (name, value) in child.secret_names.iter().zip(child.secret_values.iter()) {
         let placeholder = format!("__{}__", name);
         manifest_toml = manifest_toml.replace(&placeholder, value);
     }
-    manifest_toml = manifest_toml.replace(PACKAGE_PLACEHOLDER, &state.current_package);
+    manifest_toml = manifest_toml.replace(PACKAGE_PLACEHOLDER, &child.current_package);
 
+    let label = format!("{}{}", CHILD_MANIFEST_LABEL_PREFIX, child.name);
     store_at_label(
         String::from(STORE_ID),
-        String::from(CHILD_MANIFEST_LABEL),
+        label.clone(),
         manifest_toml.into_bytes(),
     )
     .map_err(|e| format!("store-at-label failed: {}", e))?;
 
-    let manifest_uri = format!("store://{}/{}", STORE_ID, CHILD_MANIFEST_LABEL);
+    let manifest_uri = format!("store://{}/{}", STORE_ID, label);
     let child_id = supervisor_spawn(manifest_uri.clone(), None, None)?;
     log(format!(
-        "[sentinel] spawned child {} (package={}, secrets={}, manifest={})",
+        "[sentinel] spawned name={} as {} (package={}, secrets={}, manifest={})",
+        child.name,
         child_id,
-        state.current_package,
-        state.secret_names.len(),
+        child.current_package,
+        child.secret_names.len(),
         manifest_uri,
     ));
     Ok(child_id)
