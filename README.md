@@ -2,7 +2,7 @@
 
 Supervisor + bearer-token TCP+JSON deploy gateway for theater actor systems.
 
-Runs as the top-level process for an actor system. Spawns N configured child actors at init, watches them, respawns each on crash (subject to a per-child crash-loop rate limiter). Phase 2 added the TCP+JSON command surface for deploying new package URLs and inspecting children. Phase 3 generalised from a single child to N statically-registered children, each independently rate-limited and individually targetable by `name`.
+Runs as the top-level process for an actor system. Spawns N configured child actors at init, watches them, respawns each on crash (subject to a per-child crash-loop rate limiter). Phase 2 added the TCP+JSON command surface. Phase 3 generalised from a single child to N statically-registered children, each independently rate-limited and individually targetable by `name`. Phase 3.1 added per-child chain ring buffers on top of theater 0.3.18's `handle-child-event` carrying child-id.
 
 ## What works
 
@@ -10,14 +10,14 @@ Runs as the top-level process for an actor system. Spawns N configured child act
 - On `handle-child-error` / `handle-child-exit` for a known child-id: logs a crash summary and respawns *that* child
 - Per-child rate limiter: at most 5 restarts per 60s per child; past that, the affected child is flagged `restart_blocked` and not respawned until either a `start` command for that name lands or the sentinel process restarts. Independent across children — one runaway child can't block another's respawns
 - `handle-child-external-stop` does **not** respawn (intentional shutdown)
-- A crash event whose child-id matches no tracked child (most commonly a stale event during respawn) is logged and ignored
-- Global chain ring buffer (cap 500, oldest dropped past cap) for `handle-child-event`. **Limitation**: theater's `handle-child-event` doesn't currently carry a child-id, so chain events are *not* attributable to a specific child. A theater PR has been requested to add child-id; once it lands, Phase 3.1 will swap to per-child chain rings.
+- A crash or chain event whose child-id matches no tracked child (most commonly a stale event during respawn) is logged and ignored
+- Per-child chain ring buffer (cap 500, oldest dropped past cap). Reset after each crash (the contents belonged to the run that just ended) and on a successful `start`. Reachable per-child via `get_chain { name }`
 - TCP+JSON command surface (bearer-token auth):
   - `start { name, package }` — swap the named child's package URL/path and respawn
   - `stop { name }` — gracefully stop the named child (no respawn)
   - `list` — array of all children with current id, package, and `restart_blocked`
-  - `get_chain` — global chain ring (see limitation above)
-  - `health` — listener + chain summary + per-child status array
+  - `get_chain { name }` — chain ring buffer for the named child
+  - `health` — listener address + per-child status array (id, restart state, current package, chain size)
 
 ## Configuration
 
@@ -73,10 +73,10 @@ One JSON object per connection, one JSON response, then close. All requests carr
 
 ```
 $ printf '{"token":"...","cmd":"health"}\n' | nc 127.0.0.1 8444
-{"ok":true,"listen_addr":"0.0.0.0:8444","chain_size":0,"chain_truncated":false,
+{"ok":true,"listen_addr":"0.0.0.0:8444",
  "children":[
-   {"name":"tickets-acceptor","child_id":"<uuid>","restart_blocked":false,"recent_restarts":0,"current_package":"<url>"},
-   {"name":"inbox-acceptor",  "child_id":"<uuid>","restart_blocked":false,"recent_restarts":0,"current_package":"<url>"}
+   {"name":"tickets-acceptor","child_id":"<uuid>","restart_blocked":false,"recent_restarts":0,"current_package":"<url>","chain_size":0,"chain_truncated":false},
+   {"name":"inbox-acceptor",  "child_id":"<uuid>","restart_blocked":false,"recent_restarts":0,"current_package":"<url>","chain_size":0,"chain_truncated":false}
  ]}
 
 $ printf '{"token":"...","cmd":"list"}\n' | nc 127.0.0.1 8444
@@ -91,7 +91,7 @@ $ printf '{"token":"...","cmd":"start","name":"tickets-acceptor","package":"http
 $ printf '{"token":"...","cmd":"stop","name":"tickets-acceptor"}\n' | nc 127.0.0.1 8444
 {"ok":true,"name":"tickets-acceptor","stopped_child_id":"<uuid>"}
 
-$ printf '{"token":"...","cmd":"get_chain"}\n' | nc 127.0.0.1 8444
+$ printf '{"token":"...","cmd":"get_chain","name":"tickets-acceptor"}\n' | nc 127.0.0.1 8444
 {"ok":true,"chain":["..."],"chain_truncated":false}
 ```
 
@@ -150,8 +150,8 @@ sentinel (top-level, lives as long as the supervised system)
   │     {start, stop, list, get_chain, health}
   ├── for each configured child (statically registered at init):
   │     supervisor.spawn(store://sentinel/child-manifest-<name>) → child actor
-  └── supervisor-handlers callbacks:
-        handle-child-event       → global chain ring (no child-id today)
+  └── supervisor-handlers callbacks (theater 0.3.18+ — all carry child-id):
+        handle-child-event       → append to that child's ring (cap 500)
         handle-child-error       → log + per-child respawn (rate-limited)
         handle-child-exit        → log + per-child respawn (rate-limited)
         handle-child-external-stop → no respawn (intentional stop)
