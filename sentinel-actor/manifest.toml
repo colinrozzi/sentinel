@@ -3,11 +3,21 @@ version = "0.1.0"
 package = "/home/colin/work/actors/sentinel/target/wasm32-unknown-unknown/release/sentinel.wasm"
 # initial_state is a JSON blob (replace at deploy time):
 #   {
-#     "child_manifest_template": "<TOML body with __PACKAGE__ placeholder>",
-#     "default_package": "<URL or path to wasm artifact for initial spawn>",
-#     "listen_addr": "0.0.0.0:8443",
-#     "bearer_token": "<shared secret for the deploy endpoint>"
+#     "listen_addr": "0.0.0.0:8444",
+#     "bearer_token": "<shared secret for the deploy endpoint>",
+#     "children": {
+#       "<child-name>": {
+#         "manifest_template": "<TOML body with __PACKAGE__ + __SECRET__ placeholders>",
+#         "default_package":   "<URL or path to wasm for initial spawn>",
+#         "secrets":           { "SECRET_NAME": "<value>", ... }
+#       },
+#       ...
+#     }
 #   }
+# Each child's manifest_template must contain the literal token __PACKAGE__
+# (sentinel substitutes the current package URL at every spawn). Secrets are
+# RAM-only and never persisted on sentinel's side. Names appear in TCP
+# requests: `start { name, package }`, `stop { name }`.
 initial_state = "{}"
 
 [[handler]]
