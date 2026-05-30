@@ -1,4 +1,5 @@
-//! Sentinel actor — Phase 3.2 multi-actor supervisor with per-child chain rings.
+//! Sentinel actor — Phase 3.3 multi-actor supervisor with per-child chain
+//! rings + pre-spawn template-placeholder validation.
 //!
 //! Supervises N child actors registered statically via the operator's JSON
 //! config. Per-child:
@@ -25,6 +26,13 @@
 //! it prints the input tuple verbatim, which used to include the bearer
 //! token field of `SentinelState`'s `Value::Record` representation. The
 //! token now lives only in the store under BEARER_TOKEN_LABEL.
+//!
+//! Phase 3.3 adds pre-spawn validation: every `__KEY__` placeholder in a
+//! child's `manifest_template` must resolve to either the built-in
+//! `__PACKAGE__` or a `secrets` entry. Catches operator typos before they
+//! ever reach `spawn_child` — otherwise the literal `__KEY__` string would
+//! get persisted as the child's initial_state and (in the inbox case) leak
+//! a useless bearer-like string into the inbox content store.
 //!
 //! Notification path is intentionally absent — the phase 1 email-on-crash
 //! went through inbox, which is exactly the thing that'd be down when we'd
@@ -270,6 +278,26 @@ fn init(state: Value) -> Result<(SentinelState, ()), String> {
                 "sentinel: child '{}' default_package must be non-empty",
                 name
             ));
+        }
+        // Every __X__ placeholder in the template must resolve to either
+        // PACKAGE (always substituted) or a secret entry. Without this check
+        // a typo like `__BEARRER_TOKEN__` (or a missing secrets entry) would
+        // leave the literal placeholder in the rendered TOML, the child
+        // would get `__BEARRER_TOKEN__` as its initial_state, and (in the
+        // inbox case) the bad bearer would get persisted to the inbox store
+        // — recovery means wiping the store. Catch it before init returns.
+        let mut known: Vec<&str> = Vec::with_capacity(child.secrets.len() + 1);
+        known.push("PACKAGE");
+        for k in child.secrets.keys() {
+            known.push(k.as_str());
+        }
+        for placeholder in find_template_placeholders(&child.manifest_template) {
+            if !known.iter().any(|k| *k == placeholder) {
+                return Err(format!(
+                    "sentinel: child '{}' template references __{}__ but no secret with that name (only __PACKAGE__ is built-in)",
+                    name, placeholder
+                ));
+            }
         }
     }
 
@@ -854,6 +882,33 @@ fn spawn_child(child: &ChildState) -> Result<String, String> {
 // ============================================================================
 // Helpers
 // ============================================================================
+
+/// Scan `template` for placeholders of the shape `__NAME__` (any non-empty
+/// non-`__`-containing name between two `__` delimiters). Used by init to
+/// verify every placeholder maps to a known secret before spawn.
+///
+/// Scan is non-greedy left-to-right and mirrors the substring-replace
+/// behavior `spawn_child` uses for substitution — so a placeholder that
+/// won't actually substitute (e.g. an empty `____`) is not reported. The
+/// `__PACKAGE__` builtin is reported; the caller filters it out.
+fn find_template_placeholders(template: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < template.len() {
+        let Some(start_rel) = template[i..].find("__") else { break };
+        let start = i + start_rel;
+        let after = start + 2;
+        if after >= template.len() { break }
+        let Some(end_rel) = template[after..].find("__") else { break };
+        let end = after + end_rel;
+        let name = &template[after..end];
+        if !name.is_empty() {
+            out.push(name.to_string());
+        }
+        i = end + 2;
+    }
+    out
+}
 
 /// Render `data` as a short, mostly-printable summary for a chain line.
 /// UTF-8 if it parses, otherwise hex. Truncated to MAX_EVENT_PAYLOAD_BYTES.
