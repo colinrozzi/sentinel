@@ -18,6 +18,19 @@ package = "/home/colin/work/actors/sentinel/target/wasm32-unknown-unknown/releas
 # (sentinel substitutes the current package URL at every spawn). Secrets are
 # RAM-only and never persisted on sentinel's side. Names appear in TCP
 # requests: `start { name, package }`, `stop { name }`.
+#
+# CURRENT PRODUCTION REFERENCE: deploy/cutover-2026-06-05-mail.json
+#   Option-A cutover (mail.colinrozzi.com only via frontdoor; inbox./tickets.
+#   defer until per-host certs land). Two children: inbox-acceptor + frontdoor.
+#   Operator-secret placeholders to substitute before inlining as initial_state:
+#     __SENTINEL_BEARER__   sentinel's TCP command-surface bearer
+#     __INBOX_BEARER__      inbox API bearer (single token or rotation list)
+#     __INBOX_DKIM_KEY__    PEM with literal \n escapes (multi-line illegal in JSON)
+#   Wrap the substituted JSON in TOML triple-quote literal:
+#     initial_state = '''{...}'''
+#   (Single-quote triple — TOML literal preserves the JSON's `"` characters
+#   verbatim and tolerates `'` chars in the inlined inbox-acceptor template
+#   body. JSON never contains `'''`, so the wrap is unambiguous.)
 initial_state = "{}"
 
 [[handler]]
