@@ -21,11 +21,15 @@ package = "/home/colin/work/actors/sentinel/target/wasm32-unknown-unknown/releas
 #
 # CURRENT PRODUCTION REFERENCE: deploy/cutover-2026-06-05-mail.json
 #   Option-A cutover (mail.colinrozzi.com only via frontdoor; inbox./tickets.
-#   defer until per-host certs land). Two children: inbox-acceptor + frontdoor.
+#   defer until per-host certs land). Three children: inbox-acceptor +
+#   frontdoor + tickets-acceptor (inbox-API consumer for tickets@; no public
+#   listener, but supervised under sentinel for crash recovery).
 #   Operator-secret placeholders to substitute before inlining as initial_state:
-#     __SENTINEL_BEARER__   sentinel's TCP command-surface bearer
-#     __INBOX_BEARER__      inbox API bearer (single token or rotation list)
-#     __INBOX_DKIM_KEY__    PEM with literal \n escapes (multi-line illegal in JSON)
+#     __SENTINEL_BEARER__        sentinel's TCP command-surface bearer
+#     __INBOX_BEARER__           inbox API bearer (single token or rotation list)
+#     __INBOX_DKIM_KEY__         PEM with literal \n escapes (multi-line illegal in JSON)
+#     __TICKETS_API_TOKEN__      tickets HTTP API bearer
+#     __TICKETS_INBOX_TOKEN__    inbox API bearer for tickets@colinrozzi.com (separate from __INBOX_BEARER__)
 #   Wrap the substituted JSON in TOML triple-quote literal:
 #     initial_state = '''{...}'''
 #   (Single-quote triple — TOML literal preserves the JSON's `"` characters

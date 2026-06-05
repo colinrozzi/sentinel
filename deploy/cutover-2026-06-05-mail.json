@@ -22,6 +22,15 @@
       "secrets": {
         "FRONTDOOR_CFG": "{\"routes\": [{\"hostname\": \"mail.colinrozzi.com\", \"backend\": \"127.0.0.1:8443\"}]}"
       }
+    },
+    "tickets-acceptor": {
+      "manifest_template": "name = \"tickets-acceptor\"\nversion = \"0.1.0\"\npackage = \"__PACKAGE__\"\ninitial_state = '{\"api_token\":\"__API_TOKEN__\",\"inbox_api\":\"mail.colinrozzi.com:443\",\"inbox_token\":\"__INBOX_TOKEN__\",\"handler_manifest\":\"__HANDLER_MANIFEST__\"}'\n\n[[handler]]\ntype = \"runtime\"\n\n[[handler]]\ntype = \"tcp\"\n\n[[handler]]\ntype = \"supervisor\"\n\n[[handler]]\ntype = \"store\"\nstore_id = \"tickets\"\n",
+      "default_package": "https://github.com/colinrozzi/tickets/releases/download/release-20260604-f1153e6/tickets_acceptor-20260604-f1153e6.wasm",
+      "secrets": {
+        "API_TOKEN": "__TICKETS_API_TOKEN__",
+        "INBOX_TOKEN": "__TICKETS_INBOX_TOKEN__",
+        "HANDLER_MANIFEST": "https://github.com/colinrozzi/tickets/releases/download/release-20260604-f1153e6/ticket-handler-20260604-f1153e6.toml"
+      }
     }
   }
 }
