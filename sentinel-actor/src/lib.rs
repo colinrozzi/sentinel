@@ -27,6 +27,12 @@
 //! token field of `SentinelState`'s `Value::Record` representation. The
 //! token now lives only in the store under BEARER_TOKEN_LABEL.
 //!
+//! Phase 3.4 (theater 0.3.25, PR #108): supervisor chain subscription is
+//! opt-in. `spawn_child` calls `supervisor.subscribe-to-child` after every
+//! spawn so the per-child chain rings keep filling; lifecycle handlers
+//! (error/exit/external-stop) ride the always-on ActorResult channel and
+//! need no subscription.
+//!
 //! Phase 3.3 adds pre-spawn validation: every `__KEY__` placeholder in a
 //! child's `manifest_template` must resolve to either the built-in
 //! `__PACKAGE__` or a `secrets` entry. Catches operator typos before they
@@ -143,6 +149,7 @@ pack_types! {
         theater:simple/supervisor {
             spawn: func(manifest: string, init-state: option<value>, wasm-bytes: option<list<u8>>) -> result<string, string>,
             stop-child: func(child-id: string) -> result<_, string>,
+            subscribe-to-child: func(child-id: string) -> result<_, string>,
         }
         theater:simple/timer {
             now: func() -> u64,
@@ -182,6 +189,9 @@ fn supervisor_spawn(
 
 #[import(module = "theater:simple/supervisor", name = "stop-child")]
 fn supervisor_stop_child(child_id: String) -> Result<(), String>;
+
+#[import(module = "theater:simple/supervisor", name = "subscribe-to-child")]
+fn supervisor_subscribe_to_child(child_id: String) -> Result<(), String>;
 
 #[import(module = "theater:simple/timer", name = "now")]
 fn timer_now() -> u64;
@@ -868,6 +878,17 @@ fn spawn_child(child: &ChildState) -> Result<String, String> {
 
     let manifest_uri = format!("store://{}/{}", STORE_ID, label);
     let child_id = supervisor_spawn(manifest_uri.clone(), None, None)?;
+    // theater 0.3.25 (PR #108): chain-event delivery is opt-in — spawn no
+    // longer attaches a parent subscriber, so without this call
+    // handle-child-event never fires and the chain ring stays empty.
+    // Non-fatal on failure: the child is already running, and losing chain
+    // visibility is better than killing the (re)spawn path over it.
+    if let Err(e) = supervisor_subscribe_to_child(child_id.clone()) {
+        log(format!(
+            "[sentinel] subscribe-to-child failed name={} child={}: {} — chain ring will stay empty for this run",
+            child.name, child_id, e
+        ));
+    }
     log(format!(
         "[sentinel] spawned name={} as {} (package={}, secrets={}, manifest={})",
         child.name,
