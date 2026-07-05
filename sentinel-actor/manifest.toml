@@ -49,3 +49,8 @@ type = "tcp"
 [[handler]]
 type = "store"
 store_id = "sentinel"
+
+# Periodic tick source for the heartbeat dead-man's-switch
+# (set-interval -> handle-tick).
+[[handler]]
+type = "timer"

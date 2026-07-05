@@ -70,6 +70,11 @@ const MAX_EVENT_PAYLOAD_BYTES: usize = 256;
 const RATE_LIMIT_N: usize = 5;
 const RATE_LIMIT_M_MS: u64 = 60_000;
 
+/// Heartbeat cadence if the config doesn't override it.
+const DEFAULT_HEARTBEAT_MS: u64 = 30_000;
+/// Name the heartbeat interval is registered under (echoed back to handle-tick).
+const HEARTBEAT_TIMER_NAME: &str = "heartbeat";
+
 /// Max bytes accepted in a single inbound command line.
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 /// Per-call tcp.receive cap. We loop until newline / EOF / MAX_REQUEST_BYTES.
@@ -153,6 +158,7 @@ pack_types! {
         }
         theater:simple/timer {
             now: func() -> u64,
+            set-interval: func(name: string, interval-ms: u64) -> result<string, string>,
         }
         theater:simple/tcp {
             listen: func(address: string) -> result<string, string>,
@@ -174,6 +180,7 @@ pack_types! {
         theater:simple/supervisor-handlers.handle-child-external-stop: func(state: sentinel-state, child-id: string) -> result<sentinel-state, string>,
         theater:simple/supervisor-handlers.handle-child-event: func(state: sentinel-state, child-id: string, event-type: string, event-data: list<u8>) -> result<sentinel-state, string>,
         theater:simple/tcp-client.handle-connection: func(state: sentinel-state, connection-id: string) -> result<sentinel-state, string>,
+        theater:simple/timer.handle-tick: func(state: sentinel-state, name: string) -> result<sentinel-state, string>,
     }
 }
 
@@ -195,6 +202,9 @@ fn supervisor_subscribe_to_child(child_id: String) -> Result<(), String>;
 
 #[import(module = "theater:simple/timer", name = "now")]
 fn timer_now() -> u64;
+
+#[import(module = "theater:simple/timer", name = "set-interval")]
+fn timer_set_interval(name: String, interval_ms: u64) -> Result<String, String>;
 
 #[import(module = "theater:simple/tcp", name = "listen")]
 fn tcp_listen(address: String) -> Result<String, String>;
@@ -250,6 +260,11 @@ struct Config {
     /// Children to supervise, keyed by operator-chosen name. Names appear in
     /// TCP requests (`start`/`stop` target by name) and in log lines.
     children: BTreeMap<String, ChildCfg>,
+    /// Heartbeat cadence in ms; defaults to DEFAULT_HEARTBEAT_MS. The heartbeat
+    /// is the off-box watcher's dead-man's-switch (see handle-tick) — the #43
+    /// notification path that does not route through inbox.
+    #[serde(default)]
+    heartbeat_ms: Option<u64>,
 }
 
 // ============================================================================
@@ -273,6 +288,7 @@ fn init(state: Value) -> Result<(SentinelState, ()), String> {
     if cfg.children.is_empty() {
         return Err(String::from("sentinel: children map must be non-empty"));
     }
+    let heartbeat_ms = cfg.heartbeat_ms.unwrap_or(DEFAULT_HEARTBEAT_MS);
     for (name, child) in &cfg.children {
         if name.is_empty() {
             return Err(String::from("sentinel: child name must be non-empty"));
@@ -364,6 +380,15 @@ fn init(state: Value) -> Result<(SentinelState, ()), String> {
         }
     }
 
+    // Arm the heartbeat — the off-box watcher tails these lines and treats
+    // their ABSENCE past a threshold as the dead-man's-switch for a wedged or
+    // dead sentinel. Non-fatal: supervision works without it, and a missing
+    // heartbeat is itself the alert.
+    match timer_set_interval(HEARTBEAT_TIMER_NAME.to_string(), heartbeat_ms) {
+        Ok(_) => log(format!("[sentinel] heartbeat armed every {}ms", heartbeat_ms)),
+        Err(e) => log(format!("[sentinel] set-interval(heartbeat) failed: {}", e)),
+    }
+
     Ok((
         SentinelState {
             listen_addr: cfg.listen_addr,
@@ -372,6 +397,21 @@ fn init(state: Value) -> Result<(SentinelState, ()), String> {
         },
         (),
     ))
+}
+
+#[export(name = "theater:simple/timer.handle-tick")]
+fn handle_tick(state: SentinelState, name: String) -> Result<(SentinelState, ()), String> {
+    if name == HEARTBEAT_TIMER_NAME {
+        let now_ms = timer_now();
+        let blocked = state.children.iter().filter(|c| c.restart_blocked).count();
+        log(format!(
+            "[sentinel] heartbeat children={} blocked={} t_ms={}",
+            state.children.len(),
+            blocked,
+            now_ms
+        ));
+    }
+    Ok((state, ()))
 }
 
 #[export(name = "theater:simple/supervisor-handlers.handle-child-event")]
