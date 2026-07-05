@@ -1,10 +1,16 @@
 name = "sentinel"
 version = "0.1.0"
 package = "/home/colin/work/actors/sentinel/target/wasm32-unknown-unknown/release/sentinel.wasm"
-# initial_state is a JSON blob (replace at deploy time):
+# initial_state is a JSON config (replace at deploy time). Multi-child shape:
 #   {
-#     "child_manifest": "/abs/path/to/child/manifest.toml"
+#     "children": [
+#       { "name": "inbox-ui",   "manifest": "/abs/path/to/rendered/inbox-ui.manifest.toml" },
+#       { "name": "tickets-ui", "manifest": "/abs/path/to/rendered/tickets-ui.manifest.toml" }
+#     ],
+#     "heartbeat_ms": 30000
 #   }
+# Each child manifest is rendered at deploy time (package pin + secret
+# substitution already applied) and spawned by path.
 initial_state = "{}"
 
 [[handler]]
@@ -13,7 +19,6 @@ type = "runtime"
 [[handler]]
 type = "supervisor"
 
+# Periodic tick source for the heartbeat (set-interval -> handle-tick).
 [[handler]]
-type = "store"
-base_path = "/home/colin/work/actors/sentinel/.store"
-store_id = "sentinel"
+type = "timer"

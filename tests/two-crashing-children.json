@@ -1,0 +1,7 @@
+{
+  "children": [
+    { "name": "crash-a", "manifest": "/home/colin/work/actors/sentinel/tests/crashing-child/manifest.toml" },
+    { "name": "crash-b", "manifest": "/home/colin/work/actors/sentinel/tests/crashing-child/manifest.toml" }
+  ],
+  "heartbeat_ms": 5000
+}
