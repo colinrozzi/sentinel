@@ -46,6 +46,11 @@ type = "supervisor"
 [[handler]]
 type = "tcp"
 
+# store_id ONLY — do NOT add a base_path here. Sentinel writes each rendered
+# child manifest to store://sentinel/child-manifest-<name> and supervisor.spawn
+# resolves it back from the SAME store. Adding a base_path splits the
+# write-store from the resolve-store -> "Label not found" at spawn -> crash
+# loop. (Learned the hard way in the 2026-07-05 inbox-ui deploy.)
 [[handler]]
 type = "store"
 store_id = "sentinel"
