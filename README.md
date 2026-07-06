@@ -29,6 +29,8 @@ The original phase-1 crash-email path went through inbox — which silently fail
 
 `sentinel.service` (see `deploy/sentinel.service`) is the systemd unit — a hard `MemoryHigh=250M`/`MemoryMax=350M` cgroup ceiling + `RUST_LOG=warn` (the lessons from the 2026-07-05 incident where a debug-logging sentinel ballooned to 362MB and starved inbox). Sentinel supervises the net-new UIs (`inbox-ui`, `tickets-ui`) and later `frontdoor`; the inbox/tickets acceptors stay on their own systemd units — never the same actor or port, so no cutover gap. `deploy/topology-b-uis.json` is the Phase A children config (UI templates + secret placeholders to fill at deploy). `deploy/cutover-2026-06-05-mail.json` is the older acceptor-hosting config, retained for reference.
 
+**Deploy gotcha:** keep sentinel's own `store` handler as `store_id`-only — do **not** add a `base_path`. Sentinel writes each rendered child manifest to `store://sentinel/child-manifest-<name>` and `supervisor.spawn` resolves it from the same store; a `base_path` splits write from resolve → `Label not found` at spawn → crash loop. (Bit the 2026-07-05 inbox-ui deploy.) And wrap the rendered `initial_state` JSON in a **triple** single-quote TOML literal, not single — the child templates contain single-quotes.
+
 ## Configuration
 
 `sentinel-actor/manifest.toml`'s `initial_state` is a JSON document:
