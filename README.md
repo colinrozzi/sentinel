@@ -65,6 +65,7 @@ Per child:
 - `manifest_template` — the child's full `manifest.toml` body, with placeholders for any values that vary per deploy
 - `default_package` — initial wasm artifact URL/path; the first spawn substitutes this into `__PACKAGE__`. Subsequent `start { name, package: ... }` commands rewrite it
 - `secrets` — `{"KEY": "value"}` map; every `__KEY__` placeholder in the template is substituted with the corresponding value at every spawn
+- `subscribe` (optional, default `true`) — whether sentinel subscribes to this child's chain events. Set `false` for a high-traffic singleton like `frontdoor` on public `:443`: a subscribed supervisor records every per-connection chain event as its own chain entry, and under internet scanner storms that amplification saturates theater's event-notification channel (the `no available capacity` wedge). Supervision (crash/exit/external-stop) is always-on regardless, so the child is still respawned — only its per-event chain ring stays empty
 
 Placeholders:
 

@@ -116,6 +116,11 @@ pub struct ChildState {
     /// RAM-only — never written to disk on sentinel's side.
     pub secret_names: Vec<String>,
     pub secret_values: Vec<String>,
+    /// Whether sentinel subscribes to this child's chain events. False for
+    /// high-traffic singletons (e.g. frontdoor on public :443) to avoid the
+    /// chain-amplification wedge — see `ChildCfg::subscribe`. Supervision
+    /// (crash/exit/external-stop) is unaffected; only the chain ring stays empty.
+    pub subscribe: bool,
     /// theater-assigned child id from the most recent successful spawn.
     /// Empty until init's first spawn lands.
     pub child_id: String,
@@ -248,6 +253,23 @@ struct ChildCfg {
     /// left as-is on subsequent passes.
     #[serde(default)]
     secrets: BTreeMap<String, String>,
+    /// Whether sentinel subscribes to this child's chain events (chain-event
+    /// delivery is opt-in on theater f852aec3+). Default true. Set false for a
+    /// high-traffic singleton like frontdoor on public :443: a subscribed
+    /// supervisor records every one of the child's per-connection chain events
+    /// as its own chain entry, and under internet scanner storms that
+    /// amplification saturates theater's event-notification channel — the
+    /// "no available capacity" wedge that stalled the earlier phase-2 attempt.
+    /// Lifecycle handlers (error/exit/external-stop) are always-on regardless
+    /// of subscription, so an unsubscribed child is still supervised and
+    /// respawned; only its per-event chain ring stays empty (which for a :443
+    /// scanner magnet is 99% junk anyway).
+    #[serde(default = "default_subscribe")]
+    subscribe: bool,
+}
+
+fn default_subscribe() -> bool {
+    true
 }
 
 #[derive(Deserialize)]
@@ -357,6 +379,7 @@ fn init(state: Value) -> Result<(SentinelState, ()), String> {
                 current_package: child_cfg.default_package,
                 secret_names,
                 secret_values,
+                subscribe: child_cfg.subscribe,
                 child_id: String::new(),
                 chain: Vec::new(),
                 chain_truncated: false,
@@ -923,10 +946,22 @@ fn spawn_child(child: &ChildState) -> Result<String, String> {
     // handle-child-event never fires and the chain ring stays empty.
     // Non-fatal on failure: the child is already running, and losing chain
     // visibility is better than killing the (re)spawn path over it.
-    if let Err(e) = supervisor_subscribe_to_child(child_id.clone()) {
+    //
+    // Skipped entirely when child.subscribe is false (high-traffic singletons
+    // like frontdoor): not subscribing keeps the child's per-connection chain
+    // firehose from bubbling into sentinel — the amplification wedge. Lifecycle
+    // supervision is unaffected (always-on channel).
+    if child.subscribe {
+        if let Err(e) = supervisor_subscribe_to_child(child_id.clone()) {
+            log(format!(
+                "[sentinel] subscribe-to-child failed name={} child={}: {} — chain ring will stay empty for this run",
+                child.name, child_id, e
+            ));
+        }
+    } else {
         log(format!(
-            "[sentinel] subscribe-to-child failed name={} child={}: {} — chain ring will stay empty for this run",
-            child.name, child_id, e
+            "[sentinel] not subscribing to {} (subscribe=false) — chain ring stays empty by design",
+            child.name
         ));
     }
     log(format!(
