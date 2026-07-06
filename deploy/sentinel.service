@@ -1,0 +1,53 @@
+# sentinel.service — one clean sentinel instance (Phase A, Topology B).
+#
+# Mirrors inbox.service (runs as root, /var/lib/<unit> layout). The lessons
+# from the 2026-07-05 incident are baked in:
+#   - hard cgroup memory ceiling so a leak is throttled then OOM-killed and
+#     restarted as a UNIT, instead of silently starving inbox on the 964MB box
+#     (the debug-logging experiment ballooned to 362MB and took prod down).
+#   - warn/error-only logging (debug/trace logging was the balloon's cause).
+#
+# Topology B: sentinel supervises the net-new UIs (inbox-ui, tickets-ui) and
+# later frontdoor. inbox / tickets acceptors stay on their own systemd units —
+# sentinel never supervises the same actor or binds the same port, so the two
+# run side by side with no cutover gap.
+
+[Unit]
+Description=sentinel — supervises the prod actor tree (inbox-ui, tickets-ui, frontdoor; Phase A)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# The theater binary must be the prod-pinned f852aec3 build (#131+#132), same
+# store path inbox runs. Preferred: sentinel's OWN gc-root realised to that
+# store path, so the two units don't share a root:
+#   nix build <f852aec3>#theater -o /var/lib/sentinel/gc-roots/theater
+# (Immediate fallback that works today: inbox's existing gc-root, which already
+#  points at the f852aec3 build — /var/lib/inbox/gc-roots/theater/bin/theater.)
+ExecStart=/var/lib/sentinel/gc-roots/theater/bin/theater spawn /var/lib/sentinel/sentinel-actor/manifest.toml
+WorkingDirectory=/var/lib/sentinel
+# No User= — runs as root, mirroring inbox.service.
+
+# --- the memory ceiling (the point of this unit) ---
+# MemoryHigh throttles reclaim as we approach; MemoryMax is the hard OOM-kill
+# line. Sized for Topology B (sentinel + inbox-ui + tickets-ui + frontdoor,
+# ~4 in-theater actors). Re-tune only after measuring; do NOT raise blindly.
+MemoryHigh=250M
+MemoryMax=350M
+MemoryAccounting=yes
+
+# --- logging discipline ---
+# warn/error only. No debug/trace in prod — that is what caused the balloon.
+Environment=RUST_LOG=warn
+
+# --- restart policy ---
+# Sentinel restarting reboots the whole in-process child tree, so restart on
+# failure but back off. The in-actor per-child crash-loop rate limiter handles
+# child thrash; this is the outer guard for the sentinel process itself.
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

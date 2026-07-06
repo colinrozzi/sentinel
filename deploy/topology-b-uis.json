@@ -1,0 +1,24 @@
+{
+  "listen_addr": "127.0.0.1:8444",
+  "bearer_token": "__SENTINEL_BEARER__",
+  "heartbeat_ms": 30000,
+  "children": {
+    "inbox-ui": {
+      "manifest_template": "name = \"inbox-ui-acceptor\"\nversion = \"0.1.0\"\npackage = \"__PACKAGE__\"\ninitial_state = '{\"bearer_token\":\"__BEARER_TOKEN__\",\"basic_auth\":\"__BASIC_AUTH__\",\"api_base_url\":\"__API_BASE_URL__\",\"ui_handler_manifest\":\"__UI_HANDLER_MANIFEST__\"}'\n[[handler]]\ntype = \"runtime\"\n[[handler]]\ntype = \"tcp\"\n[[handler]]\ntype = \"supervisor\"\n[[handler]]\ntype = \"rpc\"\n[[handler]]\ntype = \"store\"\nbase_path = \"/mnt/main-volume/inbox/store\"\nstore_id = \"inbox\"",
+      "default_package": "https://github.com/colinrozzi/inbox-ui/releases/download/release-20260705-2320feb/inbox-ui-acceptor-20260705-2320feb.wasm",
+      "secrets": {
+        "BEARER_TOKEN": "__INBOX_API_BEARER__",
+        "BASIC_AUTH": "__INBOX_UI_BASIC_AUTH__",
+        "API_BASE_URL": "https://mail.colinrozzi.com:443",
+        "UI_HANDLER_MANIFEST": "https://github.com/colinrozzi/inbox-ui/releases/download/release-20260705-2320feb/inbox-ui-handler-20260705-2320feb.toml"
+      }
+    },
+    "tickets-ui": {
+      "manifest_template": "name = \"tickets-ui\"\nversion = \"0.1.0\"\npackage = \"__PACKAGE__\"\nstatic_package = true\ninitial_state = '{\"api_addr\":\"127.0.0.1:8443\",\"api_token\":\"__API_TOKEN__\",\"listen_addr\":\"127.0.0.1:9444\"}'\n[[handler]]\ntype = \"runtime\"\n[[handler]]\ntype = \"tcp\"",
+      "default_package": "https://github.com/colinrozzi/tickets-ui/releases/download/release-20260616-b242cb4/tickets_ui-20260616-b242cb4.wasm",
+      "secrets": {
+        "API_TOKEN": "__TICKETS_API_TOKEN__"
+      }
+    }
+  }
+}

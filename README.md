@@ -19,6 +19,15 @@ Runs as the top-level process for an actor system. Spawns N configured child act
   - `list` — array of all children with current id, package, and `restart_blocked`
   - `get_chain { name }` — chain ring buffer for the named child
   - `health` — listener address + per-child status array (id, restart state, current package, chain size)
+- Periodic heartbeat: every `heartbeat_ms` (default 30000) a `[sentinel] heartbeat children=N blocked=M t_ms=...` line is logged, via the `timer` handler's `set-interval` → `handle-tick`. This is the off-box watcher's **dead-man's-switch** and the out-of-band #43 notification path that does **not** route through inbox: crash lines drive detail alerts, and the *absence* of heartbeats past a threshold flags a wedged/dead sentinel.
+
+## Out-of-band notification (ticket #43)
+
+The original phase-1 crash-email path went through inbox — which silently fails to alert when inbox itself is down. It stays gone. The critical alert now lives **off the box**: an external watcher (SSH/health-probe) tails the journal for `[sentinel] crash ...` / `[sentinel] crash loop ...` and treats a missing heartbeat as the dead-man's-switch. Escalation happens from where the watcher runs, independent of the box. Rich chain diagnostics to a dev mailbox remain a deferred best-effort nicety, never the critical path.
+
+## Deployment (Topology B)
+
+`sentinel.service` (see `deploy/sentinel.service`) is the systemd unit — a hard `MemoryHigh=250M`/`MemoryMax=350M` cgroup ceiling + `RUST_LOG=warn` (the lessons from the 2026-07-05 incident where a debug-logging sentinel ballooned to 362MB and starved inbox). Sentinel supervises the net-new UIs (`inbox-ui`, `tickets-ui`) and later `frontdoor`; the inbox/tickets acceptors stay on their own systemd units — never the same actor or port, so no cutover gap. `deploy/topology-b-uis.json` is the Phase A children config (UI templates + secret placeholders to fill at deploy). `deploy/cutover-2026-06-05-mail.json` is the older acceptor-hosting config, retained for reference.
 
 ## Configuration
 
@@ -49,7 +58,7 @@ Runs as the top-level process for an actor system. Spawns N configured child act
 }
 ```
 
-The `children` map is the operator's source of truth for which actor systems sentinel supervises. The map key (e.g. `"tickets-acceptor"`) is the operator-chosen *name* that TCP commands target.
+The `children` map is the operator's source of truth for which actor systems sentinel supervises. The map key (e.g. `"tickets-acceptor"`) is the operator-chosen *name* that TCP commands target. An optional top-level `"heartbeat_ms"` (default 30000) sets the heartbeat cadence.
 
 Per child:
 
