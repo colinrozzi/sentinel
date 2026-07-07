@@ -114,6 +114,42 @@ A successful `start` resets the *per-child* crash-loop block and restart-history
 
 No TLS in v1. Acceptable for VPS-internal traffic and the early scale we're operating at; add TLS termination via a reverse proxy or upgrade the listener once the threat model demands it.
 
+## Mesh integration (round one)
+
+Sentinel can become a member of a [mesh](https://github.com/colinrozzi/mesh) — the first step toward machine-management-in-theater. **Round one proves the messaging only**: sentinel spawns a mesh node as a child and exchanges one message end-to-end. Sentinel stays a **thin translation layer** — a mesh message in maps to a primitive op; a lifecycle event out maps to a mesh message. No mesh logic lives in sentinel.
+
+Enable it with an optional top-level `"mesh"` block in `initial_state`:
+
+```json
+{
+  "listen_addr": "127.0.0.1:8444",
+  "bearer_token": "<secret>",
+  "children": {},
+  "mesh": {
+    "node_manifest": "/abs/path/or/store-or-https/mesh-node.manifest.toml",
+    "node_seed": "sentinel-mesh-poc",
+    "node_listen": "127.0.0.1:9460",
+    "members": [],
+    "dial": []
+  }
+}
+```
+
+`members: []` + `dial: []` is a **single-node** mesh: the node self-includes, authors a genesis, and self-finalizes — so a submitted payload is delivered right back, proving the whole app↔node loop with no second node or networking.
+
+On init sentinel spawns the node child and arms a one-shot timer; on the first `mesh-arm` tick it sends the mesh `Register(self_id)` so the node knows where to deliver (the node's delivery target starts empty — **Register must precede any Submit** or the delivery callback never fires). Then:
+
+- **`mesh_submit { payload }`** (TCP command) → `encode_submit` → `message-server.request(node)` → decode the ack → returns `{"ok":true,"hash":"<hex event id>"}`.
+- **`handle-send`** (delivery callback) → the node's finalized `from[32]||body` arrives here and is logged as `[sentinel] mesh RECEIVED from <hex>: <payload>` — the PoC success signal.
+
+```
+$ printf '{"token":"...","cmd":"mesh_submit","payload":"hello"}\n' | nc 127.0.0.1 8444
+{"ok":true,"hash":"<64-hex>"}
+# journal: [sentinel] mesh RECEIVED from <hex>: hello
+```
+
+The node is infrastructure (not in the `children` map) and is not respawned in round one. Requires the `message-server` handler (in the manifest). The mesh wire codec is vendored from `mesh/mesh-api` (`mod mesh`) for the PoC. Round two maps delivered mesh commands onto sentinel's `start`/`stop`/`list` primitives and pushes lifecycle (heartbeat/crash) out over the mesh.
+
 ## Deferred: out-of-band crash notification
 
 Phase 1 originally shipped a crash-email path via the inbox HTTP API. We pulled it: sentinel-supervising-inbox would silently fail to alert when inbox is the thing that's down (the dev-agent mailbox is also hosted on the same inbox). The chain buffer is still accumulated — it's lightweight and can re-attach to whatever transport we settle on. Open design: direct-to-gmail-MX bypass, retry queue, alternate transport (file/syslog/exec), etc. Operators currently rely on the systemd log for crash awareness.

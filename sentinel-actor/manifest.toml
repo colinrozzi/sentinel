@@ -59,3 +59,9 @@ store_id = "sentinel"
 # (set-interval -> handle-tick).
 [[handler]]
 type = "timer"
+
+# Mesh integration (round one): lets sentinel drive its mesh node child over
+# theater's message-server (request -> node, node deliveries -> handle-send).
+# Only needed when initial_state carries a `mesh` block; harmless otherwise.
+[[handler]]
+type = "message-server"
