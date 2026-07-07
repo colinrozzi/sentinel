@@ -75,6 +75,14 @@ const DEFAULT_HEARTBEAT_MS: u64 = 30_000;
 /// Name the heartbeat interval is registered under (echoed back to handle-tick).
 const HEARTBEAT_TIMER_NAME: &str = "heartbeat";
 
+/// Timer that fires the one-shot mesh Register once the node child is reachable
+/// (the message-server router doesn't resolve the node until after spawn
+/// returns, so Register can't run from inside init).
+const MESH_ARM_TIMER_NAME: &str = "mesh-arm";
+/// Cadence of the mesh-arm timer. It keeps firing but no-ops after the first
+/// successful Register (idempotent via `mesh_armed`).
+const MESH_ARM_INTERVAL_MS: u64 = 1_000;
+
 /// Max bytes accepted in a single inbound command line.
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 /// Per-call tcp.receive cap. We loop until newline / EOF / MAX_REQUEST_BYTES.
@@ -95,6 +103,87 @@ const CHILD_MANIFEST_LABEL_PREFIX: &str = "child-manifest-";
 /// `SentinelState` so it never appears in the `Value::Record` representation
 /// theater prints as part of wasm-error input formatting.
 const BEARER_TOKEN_LABEL: &str = "bearer-token";
+
+// ============================================================================
+// Mesh wire codec (vendored from mesh/mesh-api/src/lib.rs)
+// ============================================================================
+//
+// The app<->node control envelope carried over theater's message-server. This
+// is a byte-for-byte copy of the four functions sentinel needs; mesh-api is the
+// source of truth. Vendored (not a dep) because sentinel builds via nix+crane
+// whose cleanSource is sentinel's dir only, so a cross-repo path dep won't
+// build. theater-dev endorsed vendoring for round one and will publish mesh-api
+// as a crate before round two touches the wire format. Keep in sync if the mesh
+// command/ack/delivery encoding ever changes.
+mod mesh {
+    use alloc::string::{String, ToString};
+    use alloc::vec::Vec;
+
+    /// A 32-byte event hash (Submit ack) or ed25519 pubkey (delivery author).
+    pub type Bytes32 = [u8; 32];
+
+    const CMD_SUBMIT: u8 = 0x01; // body = payload bytes
+    const CMD_REGISTER: u8 = 0x04; // body = app actor-id (utf8) for delivery
+
+    /// `0x01 || payload` — ask the node to author + submit a payload.
+    pub fn encode_submit(payload: &[u8]) -> Vec<u8> {
+        let mut v = Vec::with_capacity(1 + payload.len());
+        v.push(CMD_SUBMIT);
+        v.extend_from_slice(payload);
+        v
+    }
+
+    /// `0x04 || utf8(app_id)` — tell the node which app-id to deliver to. The
+    /// node's delivery target starts EMPTY, so this MUST precede any Submit or
+    /// handle-send never fires.
+    pub fn encode_register(app_id: &str) -> Vec<u8> {
+        let mut v = Vec::with_capacity(1 + app_id.len());
+        v.push(CMD_REGISTER);
+        v.extend_from_slice(app_id.as_bytes());
+        v
+    }
+
+    /// Decode a request ack: `1 || hash[32]` on success, `0 || utf8` on error.
+    pub fn decode_ack(bytes: &[u8]) -> Result<Bytes32, String> {
+        match bytes.split_first() {
+            Some((1, h)) if h.len() == 32 => {
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(h);
+                Ok(hash)
+            }
+            Some((0, e)) => Err(String::from_utf8_lossy(e).to_string()),
+            _ => Err("malformed ack".to_string()),
+        }
+    }
+
+    /// Decode a delivery (node -> app via send): `from[32] || body`.
+    pub fn decode_delivery(bytes: &[u8]) -> Option<(Bytes32, Vec<u8>)> {
+        if bytes.len() < 32 {
+            return None;
+        }
+        let mut from = [0u8; 32];
+        from.copy_from_slice(&bytes[..32]);
+        Some((from, bytes[32..].to_vec()))
+    }
+
+    /// Short hex of the first 6 bytes, for log lines.
+    pub fn short_hex(bytes: &[u8]) -> String {
+        let mut s = String::with_capacity(12);
+        for &b in bytes.iter().take(6) {
+            s.push_str(&alloc::format!("{:02x}", b));
+        }
+        s
+    }
+
+    /// Full lowercase hex of all bytes (for returning an event hash to a client).
+    pub fn hex(bytes: &[u8]) -> String {
+        let mut s = String::with_capacity(bytes.len() * 2);
+        for &b in bytes {
+            s.push_str(&alloc::format!("{:02x}", b));
+        }
+        s
+    }
+}
 
 // ============================================================================
 // State
@@ -149,17 +238,30 @@ pub struct SentinelState {
     /// order (BTreeMap, so alphabetical).
     pub children: Vec<ChildState>,
     // bearer_token intentionally NOT here — see BEARER_TOKEN_LABEL.
+    /// Mesh node child id, if a `mesh` block was configured. Empty otherwise.
+    /// The node is NOT in `children` (it's infrastructure, not a supervised
+    /// app child); lifecycle events for it fall through the "unknown child"
+    /// path and are ignored (round one does not respawn it).
+    pub mesh_node_id: String,
+    /// True once we've sent the mesh Register for this node (one-shot, on the
+    /// first mesh-arm tick). Idempotent guard so the repeating timer no-ops.
+    pub mesh_armed: bool,
 }
 
 pack_types! {
     imports {
         theater:simple/runtime {
             log: func(msg: string),
+            self: func() -> string,
         }
         theater:simple/supervisor {
             spawn: func(manifest: string, init-state: option<value>, wasm-bytes: option<list<u8>>) -> result<string, string>,
             stop-child: func(child-id: string) -> result<_, string>,
             subscribe-to-child: func(child-id: string) -> result<_, string>,
+        }
+        theater:simple/message-server-host {
+            register: func() -> result<_, string>,
+            request: func(actor-id: string, msg: list<u8>) -> result<list<u8>, string>,
         }
         theater:simple/timer {
             now: func() -> u64,
@@ -186,11 +288,26 @@ pack_types! {
         theater:simple/supervisor-handlers.handle-child-event: func(state: sentinel-state, child-id: string, event-type: string, event-data: list<u8>) -> result<sentinel-state, string>,
         theater:simple/tcp-client.handle-connection: func(state: sentinel-state, connection-id: string) -> result<sentinel-state, string>,
         theater:simple/timer.handle-tick: func(state: sentinel-state, name: string) -> result<sentinel-state, string>,
+        // Mesh delivery callback: the node calls message-server send(app, bytes)
+        // with a finalized payload; theater routes it here. The runtime passes
+        // Value::Tuple([list<u8>]), which packr unpacks as a single positional
+        // list<u8> param (same convention as handle-child-event's event-data) —
+        // NOT tuple<list<u8>> (that would expect a tuple nested in the tuple).
+        theater:simple/message-server-client.handle-send: func(state: sentinel-state, data: list<u8>) -> result<sentinel-state, string>,
     }
 }
 
 #[import(module = "theater:simple/runtime", name = "log")]
 fn log(msg: String);
+
+#[import(module = "theater:simple/runtime", name = "self")]
+fn runtime_self() -> String;
+
+#[import(module = "theater:simple/message-server-host", name = "register")]
+fn message_server_register() -> Result<(), String>;
+
+#[import(module = "theater:simple/message-server-host", name = "request")]
+fn message_server_request(actor_id: String, msg: Vec<u8>) -> Result<Vec<u8>, String>;
 
 #[import(module = "theater:simple/supervisor", name = "spawn")]
 fn supervisor_spawn(
@@ -287,6 +404,36 @@ struct Config {
     /// notification path that does not route through inbox.
     #[serde(default)]
     heartbeat_ms: Option<u64>,
+    /// Optional mesh membership. When present, sentinel spawns a mesh node child
+    /// and becomes a mesh member (round one: a thin translation layer). Absent =
+    /// no mesh, existing behavior unchanged.
+    #[serde(default)]
+    mesh: Option<MeshCfg>,
+}
+
+/// Config for the mesh node sentinel spawns + drives over the message-server.
+#[derive(Deserialize)]
+struct MeshCfg {
+    /// Path or `store://`/`https://` reference to the mesh node's manifest.
+    node_manifest: String,
+    /// Seed string the node SHA256's into its ed25519 identity.
+    node_seed: String,
+    /// Node listen address; None -> the node's default (127.0.0.1:9447).
+    #[serde(default)]
+    node_listen: Option<String>,
+    /// Other members' hex pubkeys. Empty = single-node bootstrap (the node
+    /// self-includes and self-finalizes) — the round-one PoC shape.
+    #[serde(default)]
+    members: Vec<String>,
+    /// Peers to outbound-dial on init (subset of members). Empty for single-node.
+    #[serde(default)]
+    dial: Vec<PeerEntry>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct PeerEntry {
+    pubkey: String,
+    address: String,
 }
 
 // ============================================================================
@@ -307,8 +454,10 @@ fn init(state: Value) -> Result<(SentinelState, ()), String> {
     if cfg.bearer_token.is_empty() {
         return Err(String::from("sentinel: bearer_token must be non-empty"));
     }
-    if cfg.children.is_empty() {
-        return Err(String::from("sentinel: children map must be non-empty"));
+    if cfg.children.is_empty() && cfg.mesh.is_none() {
+        return Err(String::from(
+            "sentinel: nothing to do — configure `children`, a `mesh` block, or both",
+        ));
     }
     let heartbeat_ms = cfg.heartbeat_ms.unwrap_or(DEFAULT_HEARTBEAT_MS);
     for (name, child) in &cfg.children {
@@ -412,18 +561,77 @@ fn init(state: Value) -> Result<(SentinelState, ()), String> {
         Err(e) => log(format!("[sentinel] set-interval(heartbeat) failed: {}", e)),
     }
 
+    // Optional mesh membership (round one): spawn a node child and become a mesh
+    // member — sentinel stays a thin translation layer (TCP mesh_submit -> node,
+    // node delivery -> handle-send log). The Register that tells the node our
+    // app-id is deferred to the first mesh-arm tick: the node isn't reachable via
+    // the message-server router until spawn returns. The node is INFRASTRUCTURE,
+    // not in `children`; a crash of it falls through the unknown-child path (round
+    // one does not respawn it).
+    let mesh_node_id = match cfg.mesh {
+        Some(mesh) => {
+            // Declaring the message-server handler + exporting handle-send is
+            // enough for theater to route deliveries here; this explicit register
+            // is belt-and-suspenders (matches the mesh example-app).
+            if let Err(e) = message_server_register() {
+                log(format!("[sentinel] mesh: message-server register failed: {}", e));
+            }
+            let node_init = build_node_init(&mesh);
+            match supervisor_spawn(mesh.node_manifest.clone(), Some(Value::String(node_init)), None) {
+                Ok(id) => {
+                    log(format!("[sentinel] mesh: spawned node {}", id));
+                    if let Err(e) =
+                        timer_set_interval(MESH_ARM_TIMER_NAME.to_string(), MESH_ARM_INTERVAL_MS)
+                    {
+                        log(format!("[sentinel] mesh: set-interval(mesh-arm) failed: {}", e));
+                    }
+                    id
+                }
+                Err(e) => {
+                    log(format!(
+                        "[sentinel] mesh: spawn node failed: {} — mesh disabled this run",
+                        e
+                    ));
+                    String::new()
+                }
+            }
+        }
+        None => String::new(),
+    };
+
     Ok((
         SentinelState {
             listen_addr: cfg.listen_addr,
             listener_id,
             children,
+            mesh_node_id,
+            mesh_armed: false,
         },
         (),
     ))
 }
 
+/// Build the mesh node's `InitConfig` JSON from the mesh config. Mirrors the
+/// mesh example-app's `build_node_init` (raw format! — the PoC seed/addresses
+/// are simple strings needing no escaping).
+fn build_node_init(m: &MeshCfg) -> String {
+    let members = serde_json::to_string(&m.members).unwrap_or_else(|_| "[]".to_string());
+    let dial = serde_json::to_string(&m.dial).unwrap_or_else(|_| "[]".to_string());
+    match &m.node_listen {
+        Some(listen) if !listen.is_empty() => format!(
+            r#"{{"node_seed":"{}","listen_addr":"{}","members":{},"dial":{}}}"#,
+            m.node_seed, listen, members, dial
+        ),
+        _ => format!(
+            r#"{{"node_seed":"{}","members":{},"dial":{}}}"#,
+            m.node_seed, members, dial
+        ),
+    }
+}
+
 #[export(name = "theater:simple/timer.handle-tick")]
 fn handle_tick(state: SentinelState, name: String) -> Result<(SentinelState, ()), String> {
+    let mut state = state;
     if name == HEARTBEAT_TIMER_NAME {
         let now_ms = timer_now();
         let blocked = state.children.iter().filter(|c| c.restart_blocked).count();
@@ -433,6 +641,42 @@ fn handle_tick(state: SentinelState, name: String) -> Result<(SentinelState, ())
             blocked,
             now_ms
         ));
+    } else if name == MESH_ARM_TIMER_NAME && !state.mesh_armed && !state.mesh_node_id.is_empty() {
+        // One-shot: tell the node our app-id so it delivers finalized payloads
+        // to us. MUST land before any Submit or handle-send never fires. The
+        // node is reachable now (we're past init). Idempotent via `mesh_armed`.
+        let my_id = runtime_self();
+        let cmd = mesh::encode_register(&my_id);
+        match message_server_request(state.mesh_node_id.clone(), cmd) {
+            Ok(reply) => match mesh::decode_ack(&reply) {
+                Ok(_) => {
+                    log(format!("[sentinel] mesh: registered app-id {} for delivery", my_id));
+                    state.mesh_armed = true;
+                }
+                Err(e) => log(format!("[sentinel] mesh: register rejected: {}", e)),
+            },
+            Err(e) => log(format!("[sentinel] mesh: register request failed: {}", e)),
+        }
+    }
+    Ok((state, ()))
+}
+
+/// Mesh delivery callback: the node calls message-server `send(app, bytes)` with
+/// a finalized payload; theater routes it here. Round one just decodes + logs —
+/// this is the PoC success signal. (Round two maps delivered mesh commands onto
+/// sentinel's primitives.) Kept a pure translation per Colin's constraint.
+#[export(name = "theater:simple/message-server-client.handle-send")]
+fn handle_send(state: SentinelState, data: Vec<u8>) -> Result<(SentinelState, ()), String> {
+    match mesh::decode_delivery(&data) {
+        Some((from, body)) => log(format!(
+            "[sentinel] mesh RECEIVED from {}: {}",
+            mesh::short_hex(&from),
+            String::from_utf8_lossy(&body)
+        )),
+        None => log(format!(
+            "[sentinel] mesh: malformed delivery ({} bytes)",
+            data.len()
+        )),
     }
     Ok((state, ()))
 }
@@ -516,6 +760,9 @@ struct Request {
     /// template gets rendered with this value before the spawn.
     #[serde(default)]
     package: Option<String>,
+    /// Used by `mesh_submit`. The payload string to submit to the mesh.
+    #[serde(default)]
+    payload: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -655,6 +902,7 @@ fn dispatch_request(state: &mut SentinelState, request_bytes: &[u8]) -> Vec<u8> 
         "get_chain" => cmd_get_chain(state, req.name),
         "start" => cmd_start(state, req.name, req.package),
         "stop" => cmd_stop(state, req.name),
+        "mesh_submit" => cmd_mesh_submit(state, req.payload),
         other => error_response(&format!("unknown cmd: {}", other)),
     }
 }
@@ -797,6 +1045,42 @@ fn encode<T: Serialize>(value: &T) -> Vec<u8> {
             v
         }
         Err(e) => error_response(&format!("encode failed: {}", e)),
+    }
+}
+
+#[derive(Serialize)]
+struct MeshSubmitResp<'a> {
+    ok: bool,
+    /// Hex of the finalized event hash the node acked.
+    hash: &'a str,
+}
+
+/// `mesh_submit {payload}` — translate a TCP command into a mesh Submit. Pure
+/// translation per Colin's thin-layer constraint: encode -> request the node ->
+/// decode the ack -> return the event hash. No mesh logic in sentinel.
+fn cmd_mesh_submit(state: &SentinelState, payload: Option<String>) -> Vec<u8> {
+    if state.mesh_node_id.is_empty() {
+        return error_response("mesh not configured");
+    }
+    if !state.mesh_armed {
+        return error_response("mesh not armed yet (Register pending) — retry shortly");
+    }
+    let cmd = mesh::encode_submit(payload.unwrap_or_default().as_bytes());
+    match message_server_request(state.mesh_node_id.clone(), cmd) {
+        Ok(reply) => match mesh::decode_ack(&reply) {
+            Ok(hash) => {
+                let hex = mesh::hex(&hash);
+                match serde_json::to_vec(&MeshSubmitResp { ok: true, hash: &hex }) {
+                    Ok(mut v) => {
+                        v.push(b'\n');
+                        v
+                    }
+                    Err(e) => error_response(&format!("encode mesh resp: {}", e)),
+                }
+            }
+            Err(e) => error_response(&format!("mesh submit rejected: {}", e)),
+        },
+        Err(e) => error_response(&format!("mesh request failed: {}", e)),
     }
 }
 
