@@ -42,16 +42,36 @@
             (type == "directory");
         };
 
+        # PIC side-module link flags (packr 0.8.x recipe). theater 0.8.1 loads
+        # guests as position-independent side modules. These MUST reach the real
+        # cargo invocation; crane does NOT honor the repo .cargo/config.toml (kept
+        # in-tree for devshell / plain-cargo), so pass them via
+        # CARGO_ENCODED_RUSTFLAGS — highest cargo precedence, can't be shadowed.
+        # Flags joined by 0x1f (ASCII unit separator), cargo's encoded delimiter.
+        picSep = builtins.fromJSON "\"\\u001f\"";
+        picRustflags = builtins.concatStringsSep picSep [
+          "-C" "relocation-model=pic"
+          "-C" "link-arg=--experimental-pic"
+          "-C" "link-arg=-shared"
+          "-C" "link-arg=--import-memory"
+          "-C" "link-arg=--export=__wasm_call_ctors"
+        ];
+
         commonArgs = {
           inherit src;
           pname = "sentinel";
           version = "0.1.0";
           cargoExtraArgs = "--target wasm32-unknown-unknown";
           CARGO_BUILD_TARGET = "wasm32-unknown-unknown";
+          CARGO_ENCODED_RUSTFLAGS = picRustflags;
           doCheck = false;
         };
 
-        cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+        # No buildDepsOnly under PIC: crane's synthetic deps-only crate doesn't
+        # depend on packr-guest, so it lacks the `pic`-feature __heap_base/
+        # __data_end symbols the -shared link needs (link fails "__heap_base not
+        # found"); it also sidesteps a libstd leak. One buildPackage pass instead.
+        cargoArtifacts = null;
 
         theaterBin = theater.packages.${system}.default;
 

@@ -8,6 +8,6 @@ name = "sentinel"
 crate-type = ["cdylib"]
 
 [dependencies]
-packr-guest = { version = "0.7", features = ["derive"] }
+packr-guest = { version = "0.8.1", features = ["derive", "pic"] }
 serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }

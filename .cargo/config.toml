@@ -1,0 +1,7 @@
+# PIC side-module link flags for packr 0.8.x (fleet ABI rollout).
+# theater 0.8.1 loads guests as position-independent side modules; this makes
+# rustc emit a PIC wasm-cdylib. Kept in-tree for devshell / plain-cargo builds.
+# NOTE: the nix+crane build does NOT honor this file — it passes the same flags
+# via CARGO_ENCODED_RUSTFLAGS in flake.nix (crane ignores repo .cargo config).
+[target.wasm32-unknown-unknown]
+rustflags = ["-C","relocation-model=pic","-C","link-arg=--experimental-pic","-C","link-arg=-shared","-C","link-arg=--import-memory","-C","link-arg=--export=__wasm_call_ctors"]
