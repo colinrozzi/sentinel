@@ -1,0 +1,17 @@
+# packr 0.10.2 self-contained fixed-base link recipe (theater 0.10.x loader does
+# assert_self_contained). Non-PIC, built at a fixed absolute base so data needs
+# no relocation. For devshell / plain-cargo builds; the nix+crane build passes
+# the same flags via CARGO_ENCODED_RUSTFLAGS (crane ignores this file).
+# Single-package actor -> --global-base=0x50000 (327680). See theater
+# docs/self-contained-actor-recipe.md. Deploy artifact is the .composite.wasm
+# (theater compose), NOT the bare member.
+[target.wasm32-unknown-unknown]
+rustflags = [
+    "-C", "link-arg=--import-memory",
+    "-C", "link-arg=--initial-memory=8388608",
+    "-C", "link-arg=--stack-first",
+    "-C", "link-arg=-zstack-size=262144",
+    "-C", "link-arg=--global-base=327680",
+    "-C", "link-arg=--no-entry",
+    "-C", "link-arg=--no-merge-data-segments",
+]
