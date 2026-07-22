@@ -13,8 +13,14 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  build:
-    name: nix build + verify self-contained composites
+  # Single sequential job on purpose: build + clippy + fmt share the theater
+  # dependency, rust toolchain, and cargo artifacts. Running them as separate
+  # concurrent jobs made both hammer the GitHub-backed magic-nix-cache at once
+  # and tripped its rate limit (HTTP 418 ResourceExhausted). One job fetches the
+  # deps once; clippy/fmt then reuse the already-built store paths — reliable and
+  # faster (no duplicate theater compile).
+  ci:
+    name: build + verify self-contained + lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -56,17 +62,9 @@ jobs:
             echo "self-contained: $C ($(stat -c%s "$C") bytes)"
           done
 
-  lint:
-    name: clippy + fmt
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: DeterminateSystems/nix-installer-action@main
-      - uses: DeterminateSystems/magic-nix-cache-action@main
-
       # Both are flake outputs (fixed-base rustflags flow through commonArgs), so
-      # `nix build` runs the check and fails the job on any warning/diff.
+      # `nix build` runs the check and fails the job on any warning/diff. They
+      # reuse the deps already fetched above — no extra cache round-trips.
       - name: clippy (-D warnings)
         run: nix build .#clippy -L
 
