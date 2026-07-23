@@ -14,9 +14,10 @@
       # Tracking main (post-PR-#58/#59/#60) — supervisor.spawn signature
       # changed to (manifest, init-state: value, wasm-bytes) with auto-init.
       # Switch back to a release branch once one is cut after these merges.
-      # Pinned to the canonical packr-0.10.2 theater rev 7daab2ad (PR #141:
-      # `theater build`/`theater compose` + the 0.10.x self-contained loader).
-      url = "github:colinrozzi/theater/7daab2ad";
+      # Pinned to the packr-0.11.0 theater rev 73a4540b (PR #149: the plain-build
+      # model — composition/fuse machinery removed; actors are plain cdylibs, no
+      # compose step). Only used for packages.theater + the devShell now.
+      url = "github:colinrozzi/theater/73a4540b";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.rust-overlay.follows = "rust-overlay";
       inputs.crane.follows = "crane";
@@ -44,22 +45,16 @@
             (type == "directory");
         };
 
-        # packr 0.10.2 self-contained FIXED-BASE link flags (PIC retired). Built
-        # at a fixed absolute base (--global-base=0x50000, single-package slot) so
-        # data needs no relocation; --no-merge-data-segments keeps the CGRF
-        # __pack_types surface findable. These MUST reach the real cargo invocation;
-        # crane ignores the repo .cargo/config.toml (kept for devshell/plain-cargo),
-        # so pass them via CARGO_ENCODED_RUSTFLAGS. Joined by 0x1f (cargo's encoded
-        # delimiter). See theater docs/self-contained-actor-recipe.md.
-        picSep = builtins.fromJSON "\"\\u001f\"";
-        fixedBaseRustflags = builtins.concatStringsSep picSep [
-          "-C" "link-arg=--import-memory"
-          "-C" "link-arg=--initial-memory=8388608"
-          "-C" "link-arg=--stack-first"
-          "-C" "link-arg=-zstack-size=262144"
-          "-C" "link-arg=--global-base=327680"
+        # packr 0.11.0 plain-build link flags (composites retired). Just two:
+        # --export-memory (the cdylib exports its own growable memory; packr-guest's
+        # setup_guest!() links dlmalloc in) and --no-entry. These MUST reach the real
+        # cargo invocation; crane ignores the repo .cargo/config.toml (kept for
+        # devshell/plain-cargo), so pass them via CARGO_ENCODED_RUSTFLAGS, joined by
+        # 0x1f (cargo's encoded delimiter). See theater docs/self-contained-actor-recipe.md.
+        rustflagsSep = builtins.fromJSON "\"\\u001f\"";
+        plainBuildRustflags = builtins.concatStringsSep rustflagsSep [
+          "-C" "link-arg=--export-memory"
           "-C" "link-arg=--no-entry"
-          "-C" "link-arg=--no-merge-data-segments"
         ];
 
         commonArgs = {
@@ -68,16 +63,16 @@
           version = "0.1.0";
           cargoExtraArgs = "--target wasm32-unknown-unknown";
           CARGO_BUILD_TARGET = "wasm32-unknown-unknown";
-          CARGO_ENCODED_RUSTFLAGS = fixedBaseRustflags;
-          # theater compose (in installPhase) needs wasm-merge (binaryen) +
-          # wasm-tools on PATH; the theater binary bundles the allocator.
-          nativeBuildInputs = [ theaterBin pkgs.binaryen pkgs.wasm-tools ];
+          CARGO_ENCODED_RUSTFLAGS = plainBuildRustflags;
+          # Plain build: no compose step, so no theater binary / binaryen needed.
+          # wasm-tools stays for the host-only-imports verify in installPhase.
+          nativeBuildInputs = [ pkgs.wasm-tools ];
           doCheck = false;
         };
 
-        # No buildDepsOnly: crane's synthetic deps-only crate doesn't depend on
-        # packr-guest, so it lacks the symbols the fixed-base link needs; one
-        # buildPackage pass instead (also sidesteps a libstd leak).
+        # One buildPackage pass (cargoArtifacts = null), no separate buildDepsOnly:
+        # the synthetic deps-only crate builds a non-cdylib and can leak libstd; a
+        # single pass keeps the wasm link clean. Fast enough for this actor.
         cargoArtifacts = null;
 
         theaterBin = theater.packages.${system}.default;
@@ -85,16 +80,22 @@
       in {
         packages.default = craneLib.buildPackage (commonArgs // {
           inherit cargoArtifacts;
-          # crane builds the bare members (fixed-base, non-self-contained), then
-          # `theater compose` fuses each with the bundled allocator into a
-          # self-contained <name>.composite.wasm (imports host-only, memory +
-          # pack:alloc internalized) and verifies it. Deploy the composite — the
-          # 0.10.x loader rejects a bare member. crashing_child is the test child.
+          # packr 0.11.0 plain build: crane cargo-builds each member into a
+          # directly-loadable <name>.wasm (growable memory + pack:alloc exported,
+          # imports host theater:simple/* only) — no compose step. Install the bare
+          # wasms and verify each imports host-only. crashing_child is the test child.
           installPhaseCommand = ''
             mkdir -p $out
             dir=target/wasm32-unknown-unknown/release
             for m in sentinel crashing_child; do
-              theater compose "$dir/$m.wasm" -o "$out/$m.composite.wasm"
+              cp "$dir/$m.wasm" "$out/$m.wasm"
+              bad=$(wasm-tools print "$out/$m.wasm" | grep -E '^[[:space:]]*\(import ' | grep -v 'theater:simple/' || true)
+              if [ -n "$bad" ]; then
+                echo "ERROR: $m.wasm has non-host imports (not self-contained):"
+                echo "$bad"
+                exit 1
+              fi
+              echo "self-contained: $m.wasm"
             done
           '';
         });
@@ -113,11 +114,11 @@
         };
 
         devShells.default = craneLib.devShell {
-          packages = [ rustToolchain theaterBin pkgs.binaryen pkgs.wasm-tools pkgs.ripgrep ];
+          packages = [ rustToolchain theaterBin pkgs.wasm-tools pkgs.ripgrep ];
           shellHook = ''
-            echo "sentinel dev environment (packr 0.10.2 self-contained)"
+            echo "sentinel dev environment (packr 0.11.0 plain build)"
             echo "  cargo build --release --target wasm32-unknown-unknown"
-            echo "  theater compose <member>.wasm -o <name>.composite.wasm"
+            echo "  # the bare target/.../sentinel.wasm is directly loadable — no compose"
             echo "  theater start sentinel-actor/manifest.toml"
           '';
         };

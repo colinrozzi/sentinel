@@ -2,7 +2,7 @@ name: Release
 
 on:
   # Tag-driven release. Push a `release-*` tag (or run via workflow_dispatch on
-  # a branch) to cut a versioned, self-contained sentinel composite + sha256 +
+  # a branch) to cut a versioned, self-contained sentinel wasm + sha256 +
   # direct-spawn manifest.
   push:
     tags: ['release-*']
@@ -17,7 +17,7 @@ env:
 
 jobs:
   release:
-    name: Build composite + tag + upload artifacts
+    name: Build wasm + tag + upload artifacts
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -27,10 +27,10 @@ jobs:
       - uses: DeterminateSystems/nix-installer-action@main
       - uses: DeterminateSystems/magic-nix-cache-action@main
 
-      # Same crane + `theater compose` path as CI and prod: `nix build .#default`
-      # emits result/sentinel.composite.wasm (deploy artifact) and
-      # result/crashing_child.composite.wasm (e2e test child).
-      - name: nix build .#default (composite)
+      # Same crane plain-build path as CI and prod (packr 0.11.0, composites
+      # retired): `nix build .#default` emits result/sentinel.wasm (deploy
+      # artifact) and result/crashing_child.wasm (e2e test child).
+      - name: nix build .#default (bare wasm)
         run: |
           set -euo pipefail
           echo "::group::nix build .#default"
@@ -38,20 +38,20 @@ jobs:
           echo "::endgroup::"
           ls -la result/
 
-      - name: Assert composite is self-contained (host-only imports)
+      - name: Assert wasm is self-contained (host-only imports)
         run: |
           set -euo pipefail
-          C="result/sentinel.composite.wasm"
-          test -f "$C" || { echo "::error::composite not emitted: $C"; exit 1; }
+          C="result/sentinel.wasm"
+          test -f "$C" || { echo "::error::wasm not emitted: $C"; exit 1; }
           nix run nixpkgs#wasm-tools -- validate "$C"
           bad=$(nix run nixpkgs#wasm-tools -- print "$C" \
             | grep -E '^[[:space:]]*\(import ' | grep -v 'theater:simple/' || true)
           if [ -n "$bad" ]; then
-            echo "::error::sentinel composite has non-host imports (not self-contained):"
+            echo "::error::sentinel wasm has non-host imports (not self-contained):"
             echo "$bad"
             exit 1
           fi
-          echo "sentinel composite self-contained: $C ($(stat -c%s "$C") bytes)"
+          echo "sentinel wasm self-contained: $C ($(stat -c%s "$C") bytes)"
 
       - name: Create GitHub release and upload artifacts
         run: |
@@ -70,15 +70,15 @@ jobs:
           STAGE_TAG="${TAG#release-}"
           REPO="${{ github.repository }}"
 
-          # Deploy artifact = the self-contained COMPOSITE (a bare member is
-          # rejected by the 0.10.x loader). Copy out of the read-only nix store.
-          COMPOSITE_FILE="sentinel-${STAGE_TAG}.composite.wasm"
-          cp "result/sentinel.composite.wasm" "${COMPOSITE_FILE}"
+          # Deploy artifact = the self-contained bare wasm (packr 0.11.0 plain
+          # build; directly loadable, no compose). Copy out of the read-only nix store.
+          COMPOSITE_FILE="sentinel-${STAGE_TAG}.wasm"
+          cp "result/sentinel.wasm" "${COMPOSITE_FILE}"
           chmod +w "${COMPOSITE_FILE}"
 
           # sha256 sidecar: this is the checksum Phase-2's `POST /deploy
           # {url, sha256}` endpoint will verify before swapping the binary, so
-          # publish it alongside the composite.
+          # publish it alongside the wasm.
           sha256sum "${COMPOSITE_FILE}" | awk '{print $1}' > "${COMPOSITE_FILE}.sha256"
 
           COMPOSITE_URL="https://github.com/${REPO}/releases/download/${TAG}/${COMPOSITE_FILE}"
@@ -115,7 +115,7 @@ jobs:
             "${COMPOSITE_FILE}" "${COMPOSITE_FILE}.sha256" "${MANIFEST_FILE}"
 
           echo "Released $TAG:"
-          echo "  composite: ${COMPOSITE_FILE} ($(stat -c%s "${COMPOSITE_FILE}") bytes)"
+          echo "  wasm:      ${COMPOSITE_FILE} ($(stat -c%s "${COMPOSITE_FILE}") bytes)"
           echo "  sha256:    $(cat "${COMPOSITE_FILE}.sha256")"
           echo "  manifest:  ${MANIFEST_FILE}"
         env:

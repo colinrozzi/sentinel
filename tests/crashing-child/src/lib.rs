@@ -32,7 +32,9 @@ fn shutdown(data: Option<Vec<u8>>) -> Result<(), String>;
 
 #[export(name = "theater:simple/actor.init")]
 fn init(_state: Value) -> Result<(bool, ()), String> {
-    log(String::from("[crashing-child] init — about to shutdown with error"));
+    log(String::from(
+        "[crashing-child] init — about to shutdown with error",
+    ));
     let _ = shutdown(Some(b"deliberate test crash".to_vec()));
     Ok((false, ()))
 }
