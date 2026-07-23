@@ -446,7 +446,11 @@ fn init(state: Value) -> Result<(SentinelState, ()), String> {
 
     let raw = match state {
         Value::String(s) if !s.is_empty() => s,
-        _ => return Err(String::from("sentinel: initial_state must be a JSON config string")),
+        _ => {
+            return Err(String::from(
+                "sentinel: initial_state must be a JSON config string",
+            ))
+        }
     };
     let cfg: Config = serde_json::from_str(&raw)
         .map_err(|e| format!("sentinel: bad initial_state JSON: {}", e))?;
@@ -557,7 +561,10 @@ fn init(state: Value) -> Result<(SentinelState, ()), String> {
     // dead sentinel. Non-fatal: supervision works without it, and a missing
     // heartbeat is itself the alert.
     match timer_set_interval(HEARTBEAT_TIMER_NAME.to_string(), heartbeat_ms) {
-        Ok(_) => log(format!("[sentinel] heartbeat armed every {}ms", heartbeat_ms)),
+        Ok(_) => log(format!(
+            "[sentinel] heartbeat armed every {}ms",
+            heartbeat_ms
+        )),
         Err(e) => log(format!("[sentinel] set-interval(heartbeat) failed: {}", e)),
     }
 
@@ -574,16 +581,26 @@ fn init(state: Value) -> Result<(SentinelState, ()), String> {
             // enough for theater to route deliveries here; this explicit register
             // is belt-and-suspenders (matches the mesh example-app).
             if let Err(e) = message_server_register() {
-                log(format!("[sentinel] mesh: message-server register failed: {}", e));
+                log(format!(
+                    "[sentinel] mesh: message-server register failed: {}",
+                    e
+                ));
             }
             let node_init = build_node_init(&mesh);
-            match supervisor_spawn(mesh.node_manifest.clone(), Some(Value::String(node_init)), None) {
+            match supervisor_spawn(
+                mesh.node_manifest.clone(),
+                Some(Value::String(node_init)),
+                None,
+            ) {
                 Ok(id) => {
                     log(format!("[sentinel] mesh: spawned node {}", id));
                     if let Err(e) =
                         timer_set_interval(MESH_ARM_TIMER_NAME.to_string(), MESH_ARM_INTERVAL_MS)
                     {
-                        log(format!("[sentinel] mesh: set-interval(mesh-arm) failed: {}", e));
+                        log(format!(
+                            "[sentinel] mesh: set-interval(mesh-arm) failed: {}",
+                            e
+                        ));
                     }
                     id
                 }
@@ -650,7 +667,10 @@ fn handle_tick(state: SentinelState, name: String) -> Result<(SentinelState, ())
         match message_server_request(state.mesh_node_id.clone(), cmd) {
             Ok(reply) => match mesh::decode_ack(&reply) {
                 Ok(_) => {
-                    log(format!("[sentinel] mesh: registered app-id {} for delivery", my_id));
+                    log(format!(
+                        "[sentinel] mesh: registered app-id {} for delivery",
+                        my_id
+                    ));
                     state.mesh_armed = true;
                 }
                 Err(e) => log(format!("[sentinel] mesh: register rejected: {}", e)),
@@ -866,7 +886,7 @@ fn receive_line(conn_id: &str) -> Result<Vec<u8>, String> {
             break;
         }
         buf.extend_from_slice(&chunk);
-        if buf.iter().any(|&b| b == b'\n') {
+        if buf.contains(&b'\n') {
             break;
         }
     }
@@ -965,11 +985,7 @@ fn cmd_get_chain(state: &SentinelState, name: Option<String>) -> Vec<u8> {
     })
 }
 
-fn cmd_start(
-    state: &mut SentinelState,
-    name: Option<String>,
-    package: Option<String>,
-) -> Vec<u8> {
+fn cmd_start(state: &mut SentinelState, name: Option<String>, package: Option<String>) -> Vec<u8> {
     let Some(name) = name else {
         return error_response("start requires `name` field");
     };
@@ -1070,7 +1086,10 @@ fn cmd_mesh_submit(state: &SentinelState, payload: Option<String>) -> Vec<u8> {
         Ok(reply) => match mesh::decode_ack(&reply) {
             Ok(hash) => {
                 let hex = mesh::hex(&hash);
-                match serde_json::to_vec(&MeshSubmitResp { ok: true, hash: &hex }) {
+                match serde_json::to_vec(&MeshSubmitResp {
+                    ok: true,
+                    hash: &hex,
+                }) {
                     Ok(mut v) => {
                         v.push(b'\n');
                         v
@@ -1086,7 +1105,10 @@ fn cmd_mesh_submit(state: &SentinelState, payload: Option<String>) -> Vec<u8> {
 
 fn error_response(msg: &str) -> Vec<u8> {
     // Best-effort — if even error encoding fails we send a hardcoded line.
-    match serde_json::to_vec(&ErrResp { ok: false, error: msg }) {
+    match serde_json::to_vec(&ErrResp {
+        ok: false,
+        error: msg,
+    }) {
         Ok(mut v) => {
             v.push(b'\n');
             v
@@ -1098,12 +1120,9 @@ fn error_response(msg: &str) -> Vec<u8> {
 /// Read the deploy bearer token from the content store. Two host calls —
 /// resolve label to content-ref, fetch content. Called on every TCP request.
 fn load_bearer_token() -> Result<Vec<u8>, String> {
-    let content_ref = store_get_by_label(
-        String::from(STORE_ID),
-        String::from(BEARER_TOKEN_LABEL),
-    )
-    .map_err(|e| format!("get-by-label: {}", e))?
-    .ok_or_else(|| String::from("bearer token label missing"))?;
+    let content_ref = store_get_by_label(String::from(STORE_ID), String::from(BEARER_TOKEN_LABEL))
+        .map_err(|e| format!("get-by-label: {}", e))?
+        .ok_or_else(|| String::from("bearer token label missing"))?;
     store_get(String::from(STORE_ID), content_ref).map_err(|e| format!("get: {}", e))
 }
 
@@ -1154,7 +1173,11 @@ fn on_crash(mut state: SentinelState, child_id: &str, reason: &str) -> SentinelS
         reason,
         now_ms,
         child.chain.len(),
-        if child.chain_truncated { " (TRUNCATED)" } else { "" },
+        if child.chain_truncated {
+            " (TRUNCATED)"
+        } else {
+            ""
+        },
         recent,
     ));
 
@@ -1275,11 +1298,17 @@ fn find_template_placeholders(template: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < template.len() {
-        let Some(start_rel) = template[i..].find("__") else { break };
+        let Some(start_rel) = template[i..].find("__") else {
+            break;
+        };
         let start = i + start_rel;
         let after = start + 2;
-        if after >= template.len() { break }
-        let Some(end_rel) = template[after..].find("__") else { break };
+        if after >= template.len() {
+            break;
+        }
+        let Some(end_rel) = template[after..].find("__") else {
+            break;
+        };
         let end = after + end_rel;
         let name = &template[after..end];
         if !name.is_empty() {
@@ -1302,7 +1331,11 @@ fn summarize_payload(data: &[u8]) -> String {
         data
     };
     let mut s = match core::str::from_utf8(slice) {
-        Ok(text) if text.chars().all(|c| !c.is_control() || c == '\n' || c == '\t') => {
+        Ok(text)
+            if text
+                .chars()
+                .all(|c| !c.is_control() || c == '\n' || c == '\t') =>
+        {
             text.to_string()
         }
         _ => {
@@ -1314,9 +1347,9 @@ fn summarize_payload(data: &[u8]) -> String {
             hex
         }
     };
-    s = s.replace('\n', " ").replace('\r', " ");
+    s = s.replace(['\n', '\r'], " ");
     if data.len() > MAX_EVENT_PAYLOAD_BYTES {
-        s.push_str("…");
+        s.push('…');
     }
     s
 }

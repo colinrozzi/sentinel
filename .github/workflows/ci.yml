@@ -28,12 +28,12 @@ jobs:
       - uses: DeterminateSystems/nix-installer-action@main
       - uses: DeterminateSystems/magic-nix-cache-action@main
 
-      # sentinel uses crane + `theater compose` (NOT `theater build`): crane
-      # cargo-builds the fixed-base members with CARGO_ENCODED_RUSTFLAGS, then
-      # the flake's installPhase fuses each with the packr bundled allocator into
-      # a self-contained <name>.composite.wasm. `nix build .#default` is the exact
-      # thing that produced the deployed prod artifact, so CI exercises that path.
-      - name: nix build .#default (composites)
+      # packr 0.11.0 plain build (composites retired): crane cargo-builds each
+      # member with CARGO_ENCODED_RUSTFLAGS (--export-memory --no-entry) into a
+      # directly-loadable bare <name>.wasm — no compose step. `nix build .#default`
+      # is the exact thing that produces the deployed prod artifact, so CI
+      # exercises that path.
+      - name: nix build .#default (bare wasms)
         run: |
           set -euo pipefail
           echo "::group::nix build .#default"
@@ -41,16 +41,16 @@ jobs:
           echo "::endgroup::"
           ls -la result/
 
-      # Belt-and-suspenders on top of `theater compose`'s own verify: each
-      # composite validates and every RESIDUAL import is a host theater:simple/*
-      # func (no env.memory / pack:alloc / __linear_memory) — i.e. self-contained.
-      # sentinel.composite.wasm is the deploy artifact; crashing_child is the
-      # end-to-end test child (must also be self-contained to spawn under 0.10.x).
-      - name: Assert composites are self-contained (host-only imports)
+      # Belt-and-suspenders on top of the flake installPhase's own verify: each
+      # bare wasm validates and every import is a host theater:simple/* func (no
+      # env.memory / pack:alloc / __linear_memory) — i.e. self-contained.
+      # sentinel.wasm is the deploy artifact; crashing_child is the end-to-end test
+      # child (must also be self-contained to spawn).
+      - name: Assert wasms are self-contained (host-only imports)
         run: |
           set -euo pipefail
-          for C in result/sentinel.composite.wasm result/crashing_child.composite.wasm; do
-            test -f "$C" || { echo "::error::composite not emitted: $C"; exit 1; }
+          for C in result/sentinel.wasm result/crashing_child.wasm; do
+            test -f "$C" || { echo "::error::wasm not emitted: $C"; exit 1; }
             nix run nixpkgs#wasm-tools -- validate "$C"
             bad=$(nix run nixpkgs#wasm-tools -- print "$C" \
               | grep -E '^[[:space:]]*\(import ' | grep -v 'theater:simple/' || true)
