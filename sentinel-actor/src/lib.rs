@@ -427,13 +427,21 @@ struct MeshCfg {
     /// Node listen address; None -> the node's default (127.0.0.1:9447).
     #[serde(default)]
     node_listen: Option<String>,
-    /// Other members' hex pubkeys. Empty = single-node bootstrap (the node
-    /// self-includes and self-finalizes) — the round-one PoC shape.
+    /// GENESIS member set — the founding pubkeys, byte-identical on every node in
+    /// the mesh (init does NOT auto-add self; a node whose key is absent is a
+    /// joiner). Empty = single-node bootstrap ({self}). NOT "all OTHER members".
     #[serde(default)]
     members: Vec<String>,
-    /// Peers to outbound-dial on init (subset of members). Empty for single-node.
+    /// Peers to outbound-dial on init (targets should be genesis members). Empty
+    /// for single-node.
     #[serde(default)]
     dial: Vec<PeerEntry>,
+    /// Mesh-node ADMISSION gate: hex pubkeys allowed to self-join (become members
+    /// on connect). Distinct from `command_allow` — join_allow lets a node onto
+    /// the mesh; command_allow authorizes its control verbs. A control mesh needs
+    /// BOTH keyed on the operator (e.g. sentinelctl's) pubkey.
+    #[serde(default)]
+    join_allow: Vec<String>,
     /// Control-plane authz: hex pubkeys permitted to drive sentinel over mesh
     /// control (list/start/stop/...). Empty/absent = reject ALL control commands
     /// (default-deny). Checked against the delivery's authenticated author pubkey.
@@ -652,14 +660,15 @@ fn init(state: Value) -> Result<(SentinelState, ()), String> {
 fn build_node_init(m: &MeshCfg) -> String {
     let members = serde_json::to_string(&m.members).unwrap_or_else(|_| "[]".to_string());
     let dial = serde_json::to_string(&m.dial).unwrap_or_else(|_| "[]".to_string());
+    let join_allow = serde_json::to_string(&m.join_allow).unwrap_or_else(|_| "[]".to_string());
     match &m.node_listen {
         Some(listen) if !listen.is_empty() => format!(
-            r#"{{"node_seed":"{}","listen_addr":"{}","members":{},"dial":{}}}"#,
-            m.node_seed, listen, members, dial
+            r#"{{"node_seed":"{}","listen_addr":"{}","members":{},"join_allow":{},"dial":{}}}"#,
+            m.node_seed, listen, members, join_allow, dial
         ),
         _ => format!(
-            r#"{{"node_seed":"{}","members":{},"dial":{}}}"#,
-            m.node_seed, members, dial
+            r#"{{"node_seed":"{}","members":{},"join_allow":{},"dial":{}}}"#,
+            m.node_seed, members, join_allow, dial
         ),
     }
 }
