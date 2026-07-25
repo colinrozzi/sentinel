@@ -1,0 +1,75 @@
+# packr compose manifest — sentinelctl (entry) + the mesh-client component.
+#   packr compose deploy/sentinelctl.compose.toml -o sentinelctl_composed.wasm
+#
+# sentinelctl declares the FULL mesh + mesh-control interfaces in pack_types (for
+# the hash-checked links); one [[link]] per function it actually calls. Both
+# interfaces are internalized against the mesh-client package; message-server-host
+# is NOT linked — the mesh-client component owns it, residual for theater.
+#
+# mesh_client_pkg.wasm = the v0.3.0 release artifact (mesh interface 0.3.0 shape,
+# mesh-control). Paths are relative to THIS manifest's directory (deploy/).
+
+[[component]]
+name  = "sentinelctl"
+wasm  = "../target/wasm32-unknown-unknown/release/sentinelctl.wasm"
+entry = true
+
+[[component]]
+name = "mesh-client"
+wasm = "mesh_client_pkg.wasm"   # staged next to this manifest (v0.3.0 release)
+
+# ---- mesh interface links (the 6 fns sentinelctl calls) ----
+[[link]]
+consumer = "sentinelctl"
+import   = "mesh.node-config"
+provider = "mesh-client"
+export   = "node-config"
+
+[[link]]
+consumer = "sentinelctl"
+import   = "mesh.register"
+provider = "mesh-client"
+export   = "register"
+
+[[link]]
+consumer = "sentinelctl"
+import   = "mesh.submit"
+provider = "mesh-client"
+export   = "submit"
+
+[[link]]
+consumer = "sentinelctl"
+import   = "mesh.depart"
+provider = "mesh-client"
+export   = "depart"
+
+[[link]]
+consumer = "sentinelctl"
+import   = "mesh.delivery"
+provider = "mesh-client"
+export   = "delivery"
+
+[[link]]
+consumer = "sentinelctl"
+import   = "mesh.is-ready"
+provider = "mesh-client"
+export   = "is-ready"
+
+# ---- mesh-control interface links (the 3 fns sentinelctl calls) ----
+[[link]]
+consumer = "sentinelctl"
+import   = "mesh-control.encode-command"
+provider = "mesh-client"
+export   = "encode-command"
+
+[[link]]
+consumer = "sentinelctl"
+import   = "mesh-control.control-kind"
+provider = "mesh-client"
+export   = "control-kind"
+
+[[link]]
+consumer = "sentinelctl"
+import   = "mesh-control.decode-response"
+provider = "mesh-client"
+export   = "decode-response"

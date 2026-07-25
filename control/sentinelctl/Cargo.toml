@@ -1,0 +1,19 @@
+[package]
+name = "sentinelctl"
+version = "0.1.0"
+edition = "2021"
+description = "Ephemeral-node CLI: drive sentinel's control plane over mesh (join -> command -> depart)."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# packr-guest 0.12.1+ decodes #[import_from] Result/Option returns via FromValue
+# (no shim). 0.12.4 = the deployed compose version. derive for the GraphValue state.
+packr-guest = { version = "0.12.4", features = ["derive"] }
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
