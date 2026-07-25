@@ -26,7 +26,12 @@
     # packr CLI (packr compose + packr verify --host-only), pinned to the 0.12.2
     # tag — the composition-consumer toolchain. Used as a build tool to fuse the
     # bare sentinel with the mesh-client component into the deployable composite.
-    packr.url = "github:colinrozzi/pack/v0.12.2";
+    # 0.12.4: strips internalized interfaces from the composite __pack_types
+    # required-metadata (the load-blocker fix — the composite now declares
+    # host-only so theater stops demanding a phantom mesh handler); also carries
+    # the 0.12.3 flake fixes (doCheck=false + binaryen-wrapped), so no
+    # overrideAttrs / binaryen workarounds are needed.
+    packr.url = "github:colinrozzi/pack/v0.12.4";
   };
 
   outputs = { self, nixpkgs, flake-utils, rust-overlay, crane, theater, packr }:
@@ -81,29 +86,25 @@
         cargoArtifacts = null;
 
         theaterBin = theater.packages.${system}.default;
-        # packr's own package build runs a compose test that shells out to
-        # wasm-merge (binaryen), which is unavailable in the sealed nix build
-        # sandbox — skip its checkPhase so the CLI builds here. (Reported upstream;
-        # the belt-and-suspenders is pack-dev setting doCheck=false / gating that
-        # test in the packr flake.)
-        packrCli = (packr.packages.${system}.packr).overrideAttrs (_: { doCheck = false; });
+        # packr 0.12.3+ sets doCheck=false in its own flake and wraps the binary
+        # with binaryen on PATH, so the CLI builds in the sealed sandbox and packr
+        # compose finds wasm-merge itself — no overrideAttrs / binaryen workaround.
+        packrCli = packr.packages.${system}.packr;
 
         # The mesh-client component (mesh v0.2.0 release), pinned by content hash.
         # Node (mesh.wasm) + client are built from the same source, so this one pin
         # is a compatible node+client pair. Exports the `mesh` interface (hash
         # 9c5ad8c4) + opt-in `mesh-control` (2be499fb); imports only
         # theater:simple/message-server-host.request (residual for theater).
-        # NOTE: colinrozzi/mesh is a PRIVATE repo, so this fetchurl 404s
-        # unauthenticated (nix has no GitHub auth) — the reproducible build + CI
-        # are blocked until the mesh release assets are fetchable by nix (repo/asset
-        # public, or a nix access-token/netrc for both local + Actions). The hash
-        # below is the ACTUAL v0.2.0 release asset (sha256 3e0e2e92, 185521 bytes);
-        # it composes green + host-only (verified). (pack-dev's earlier SRI was the
-        # local /tmp staging artifact eca11274, which differs from the release
-        # binary — same mesh interface, different bytes.)
+        # The mesh-client component (mesh v0.2.1 release), pinned by content hash.
+        # Node (mesh.wasm) + client are built from the same source, so this one pin
+        # is a compatible node+client pair. Exports the `mesh` interface (hash
+        # 9c5ad8c4) + opt-in `mesh-control` (2be499fb); imports only
+        # theater:simple/message-server-host.request (residual for theater).
+        # colinrozzi/mesh is public, so this fetchurl needs no auth.
         meshClientPkg = pkgs.fetchurl {
-          url = "https://github.com/colinrozzi/mesh/releases/download/v0.2.0/mesh_client_pkg.wasm";
-          hash = "sha256-Pg4ukn9qplOwT6kUcbYykYdGv48JYFzMId+gE7JeIB4=";
+          url = "https://github.com/colinrozzi/mesh/releases/download/v0.2.1/mesh_client_pkg.wasm";
+          hash = "sha256-zjlSTyAvWjQyYLe7C4x3h2EWUaD1hKW6lW9FN9FffQA=";
         };
 
         # crane cargo-builds both members into bare wasms. crashing_child is a
@@ -169,9 +170,9 @@
         # message-server-host.request residual). crashing_child rides along as the
         # bare e2e test child.
         packages.default = pkgs.runCommand "sentinel-composed"
-          # binaryen: `packr compose` shells out to wasm-merge to fuse the
-          # multi-memory composite; it must be on PATH in the sealed sandbox.
-          { nativeBuildInputs = [ packrCli pkgs.binaryen ]; } ''
+          # packrCli (0.12.4) is wrapped with binaryen on its PATH, so packr
+          # compose finds wasm-merge itself — no separate binaryen input needed.
+          { nativeBuildInputs = [ packrCli ]; } ''
             mkdir -p $out
             packr compose ${composeManifest} -o $out/sentinel.wasm
             packr verify --host-only $out/sentinel.wasm
