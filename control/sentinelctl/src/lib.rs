@@ -9,14 +9,17 @@
 //! Lifecycle (slice 1 = `list`):
 //!   - init: register with the message server (to receive deliveries), build a mesh
 //!     InitConfig (node_seed = the manager control keypair; dial = sentinel's control
-//!     node), spawn the ephemeral node child, arm a timeout as a safety net.
-//!   - handle-send / is-ready (v0.3 sync signal — node admitted + caught up): now the
-//!     node is live, so `register` for delivery and `submit(encode-command(list))`.
+//!     node), spawn the ephemeral node child, arm the tick interval.
+//!   - handle-tick / first tick: `register(node, my_id)` with the node — the node is
+//!     only routable after spawn returns, and it CANNOT emit is-ready until it knows
+//!     our app_id, so this must precede waiting for is-ready (else we'd deadlock).
+//!   - handle-send / is-ready (v0.3 sync signal — node admitted + caught up): the node
+//!     is live and we're already registered, so `submit(encode-command(list))`.
 //!   - handle-send / delivery of a Response for our corr_id: log the result, then
 //!     `depart` cleanly (clean Depart is LOAD-BEARING — it removes the ephemeral node
 //!     instantly, so churn never stalls sentinel's control mesh; the evict-timeout
 //!     only bites when a node vanishes without departing).
-//!   - handle-tick (timeout): if we never completed, log the timeout and depart anyway.
+//!   - handle-tick / after deadline: if we never completed, log the timeout and depart.
 //!
 //! The driver (`theater spawn`) reads the RESULT/ERROR line from the actor's log and
 //! stops the spawn once done — the actor departs first, then idles until stopped.
@@ -135,6 +138,10 @@ pub struct CtlState {
     /// only once now >= this, so a set-interval build whose FIRST tick fires
     /// immediately can't depart us at ~0s before the join + round-trip complete.
     pub deadline_ms: u64,
+    /// Whether we've registered our app_id with the node yet. We register on the
+    /// FIRST tick (not in init — the node isn't routable until after spawn returns,
+    /// and not on is-ready — the node can't emit is-ready until it HAS our app_id).
+    pub registered: bool,
 }
 
 #[derive(serde::Deserialize)]
@@ -173,8 +180,6 @@ fn default_timeout() -> u64 {
 /// an immediate first tick is harmless and departure lands within one poll of the
 /// true deadline regardless of the configured timeout.
 const TIMEOUT_POLL_MS: u64 = 2000;
-
-const APP_ID: &str = "sentinel-control";
 
 #[export(name = "theater:simple/actor.init")]
 fn init(state: Value) -> Result<(CtlState, ()), String> {
@@ -234,6 +239,7 @@ fn init(state: Value) -> Result<(CtlState, ()), String> {
             corr_id: cfg.corr_id,
             phase: 0,
             deadline_ms,
+            registered: false,
         },
         (),
     ))
@@ -246,10 +252,9 @@ fn handle_send(state: CtlState, msg: Vec<u8>) -> Result<(CtlState, ()), String> 
         if state.phase != 0 {
             return Ok((state, ()));
         }
-        log("[sentinelctl] node READY — registering + submitting command".to_string());
-        if let Err(e) = mesh_register(state.node_id.clone(), APP_ID.to_string()) {
-            log(format!("[sentinelctl] register failed: {}", e));
-        }
+        log("[sentinelctl] node READY — submitting command".to_string());
+        // (registration already happened on the first tick; the node needed our
+        // app_id to be able to emit this is-ready in the first place.)
         let target = match hex_to_bytes(&state.target_hex) {
             Some(t) => t,
             None => return Err(format!("bad sentinel pubkey hex: {}", state.target_hex)),
@@ -294,6 +299,23 @@ fn handle_send(state: CtlState, msg: Vec<u8>) -> Result<(CtlState, ()), String> 
 fn handle_tick(state: CtlState, _timer: String) -> Result<(CtlState, ()), String> {
     if state.phase == 2 {
         return Ok((state, ()));
+    }
+    // First tick: register our app_id with the node now that spawn has returned and
+    // the node is routable. The node CANNOT emit is-ready until it knows our app_id
+    // (maybe_emit_ready gates on it), so this must happen BEFORE we wait for is-ready
+    // — registering inside the is-ready handler would deadlock. Mirrors example-app.
+    if !state.registered {
+        match mesh_register(state.node_id.clone(), state.my_id.clone()) {
+            Ok(_) => log("[sentinelctl] registered app_id with node for delivery".to_string()),
+            Err(e) => log(format!("[sentinelctl] register failed: {}", e)),
+        }
+        return Ok((
+            CtlState {
+                registered: true,
+                ..state
+            },
+            (),
+        ));
     }
     // Deadline guard: ignore early/immediate ticks; only give up once the wall clock
     // has actually passed the deadline, so we never depart before the join had a chance.
