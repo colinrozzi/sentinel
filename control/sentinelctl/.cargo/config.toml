@@ -1,0 +1,9 @@
+# packr 0.11+ plain-build link recipe (same as sentinel/mesh actors). setup_guest!()
+# links dlmalloc; the cdylib exports its own growable memory + __pack_alloc/__pack_free
+# and imports only host theater:simple/* (+ the mesh interfaces, which packr compose
+# internalizes against the mesh-client component). The bare wasm is then composed.
+[target.wasm32-unknown-unknown]
+rustflags = [
+    "-C", "link-arg=--export-memory",
+    "-C", "link-arg=--no-entry",
+]

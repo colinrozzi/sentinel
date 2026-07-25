@@ -121,7 +121,10 @@
               exit 1
             fi
             echo "self-contained: crashing_child.wasm"
+            # sentinel + sentinelctl are both bare (residual mesh.* / mesh-control.*
+            # imports satisfied at compose) — host-only is asserted on the COMPOSITES.
             cp "$dir/sentinel.wasm" "$out/sentinel-bare.wasm"
+            cp "$dir/sentinelctl.wasm" "$out/sentinelctl-bare.wasm"
           '';
         });
 
@@ -185,6 +188,76 @@
           export = "encode-response"
         '';
 
+        # sentinelctl composite — the ephemeral-node control CLI, the other half of
+        # the control plane. Same bare -> packr compose -> verify --host-only path,
+        # same shared mesh v0.3.0 client (node+client never skew). It links the 9
+        # fns it calls: mesh.{node-config,register,submit,depart,delivery,is-ready}
+        # + mesh-control.{encode-command,control-kind,decode-response}.
+        sentinelctlComposeManifest = pkgs.writeText "sentinelctl.compose.toml" ''
+          [[component]]
+          name = "sentinelctl"
+          wasm = "${bareBuild}/sentinelctl-bare.wasm"
+          entry = true
+
+          [[component]]
+          name = "mesh-client"
+          wasm = "${meshClientPkg}"
+
+          [[link]]
+          consumer = "sentinelctl"
+          import = "mesh.node-config"
+          provider = "mesh-client"
+          export = "node-config"
+
+          [[link]]
+          consumer = "sentinelctl"
+          import = "mesh.register"
+          provider = "mesh-client"
+          export = "register"
+
+          [[link]]
+          consumer = "sentinelctl"
+          import = "mesh.submit"
+          provider = "mesh-client"
+          export = "submit"
+
+          [[link]]
+          consumer = "sentinelctl"
+          import = "mesh.depart"
+          provider = "mesh-client"
+          export = "depart"
+
+          [[link]]
+          consumer = "sentinelctl"
+          import = "mesh.delivery"
+          provider = "mesh-client"
+          export = "delivery"
+
+          [[link]]
+          consumer = "sentinelctl"
+          import = "mesh.is-ready"
+          provider = "mesh-client"
+          export = "is-ready"
+
+          [[link]]
+          consumer = "sentinelctl"
+          import = "mesh-control.encode-command"
+          provider = "mesh-client"
+          export = "encode-command"
+
+          [[link]]
+          consumer = "sentinelctl"
+          import = "mesh-control.control-kind"
+          provider = "mesh-client"
+          export = "control-kind"
+
+          [[link]]
+          consumer = "sentinelctl"
+          import = "mesh-control.decode-response"
+          provider = "mesh-client"
+          export = "decode-response"
+        '';
+
       in {
         # The deployable artifact = sentinel COMPOSED with the mesh-client
         # component. packr compose fuses the two isolated components (multi-memory)
@@ -201,6 +274,15 @@
             packr verify --host-only $out/sentinel.wasm
             cp ${bareBuild}/crashing_child.wasm $out/crashing_child.wasm
             echo "composed + host-only verified: sentinel.wasm ($(stat -c%s $out/sentinel.wasm) bytes)"
+          '';
+
+        # sentinelctl composite — same compose + host-only gate as the responder.
+        packages.sentinelctl = pkgs.runCommand "sentinelctl-composed"
+          { nativeBuildInputs = [ packrCli ]; } ''
+            mkdir -p $out
+            packr compose ${sentinelctlComposeManifest} -o $out/sentinelctl.wasm
+            packr verify --host-only $out/sentinelctl.wasm
+            echo "composed + host-only verified: sentinelctl.wasm ($(stat -c%s $out/sentinelctl.wasm) bytes)"
           '';
 
         # The bare (pre-compose) build, exposed for debugging / the runtime e2e.

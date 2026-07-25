@@ -62,6 +62,24 @@ jobs:
             echo "self-contained: $C ($(stat -c%s "$C") bytes)"
           done
 
+      # The other control composite — sentinelctl (the ephemeral-node CLI). Same
+      # bare -> compose -> verify --host-only gate; both mesh + mesh-control strip.
+      - name: nix build .#sentinelctl + assert host-only
+        run: |
+          set -euo pipefail
+          nix build .#sentinelctl -L -o result-ctl
+          C=result-ctl/sentinelctl.wasm
+          test -f "$C" || { echo "::error::sentinelctl.wasm not emitted: $C"; exit 1; }
+          nix run nixpkgs#wasm-tools -- validate "$C"
+          bad=$(nix run nixpkgs#wasm-tools -- print "$C" \
+            | grep -E '^[[:space:]]*\(import ' | grep -v 'theater:simple/' || true)
+          if [ -n "$bad" ]; then
+            echo "::error::sentinelctl.wasm has non-host imports (not self-contained):"
+            echo "$bad"
+            exit 1
+          fi
+          echo "self-contained: sentinelctl.wasm ($(stat -c%s "$C") bytes)"
+
       # Both are flake outputs (fixed-base rustflags flow through commonArgs), so
       # `nix build` runs the check and fails the job on any warning/diff. They
       # reuse the deps already fetched above — no extra cache round-trips.
