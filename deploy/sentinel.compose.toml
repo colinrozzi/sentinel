@@ -1,0 +1,41 @@
+# packr compose manifest — sentinel (entry) + the mesh-client component.
+#
+# Produces one multi-memory composite that theater loads like any actor:
+#   packr compose deploy/sentinel.compose.toml -o sentinel_composed.wasm
+#
+# sentinel imports the `mesh` interface (declared in full in pack_types for the
+# hash-checked link); one [[link]] per function it actually calls satisfies those
+# imports from the mesh-client package's exports. message-server-host.request is
+# NOT linked — the mesh-client component owns it; it stays residual for theater.
+#
+# mesh_client_pkg.wasm is the prebuilt mesh-client component from the mesh
+# release (staged at /tmp/mesh-pilot/ for the pilot; pin to a downloaded release
+# artifact once mesh cuts the GitHub release). Its interface hash is 9c5ad8c4.
+
+# Paths are resolved relative to THIS manifest's directory (deploy/).
+[[component]]
+name  = "sentinel"
+wasm  = "../target/wasm32-unknown-unknown/release/sentinel.wasm"
+entry = true
+
+[[component]]
+name = "mesh-client"
+wasm = "/tmp/mesh-pilot/mesh_client_pkg.wasm"
+
+[[link]]
+consumer = "sentinel"
+import   = "mesh.submit"
+provider = "mesh-client"
+export   = "submit"
+
+[[link]]
+consumer = "sentinel"
+import   = "mesh.register"
+provider = "mesh-client"
+export   = "register"
+
+[[link]]
+consumer = "sentinel"
+import   = "mesh.delivery"
+provider = "mesh-client"
+export   = "delivery"
