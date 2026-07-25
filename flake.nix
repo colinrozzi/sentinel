@@ -91,20 +91,17 @@
         # compose finds wasm-merge itself — no overrideAttrs / binaryen workaround.
         packrCli = packr.packages.${system}.packr;
 
-        # The mesh-client component (mesh v0.2.0 release), pinned by content hash.
+        # The mesh-client component (mesh v0.3.0 release), pinned by content hash.
         # Node (mesh.wasm) + client are built from the same source, so this one pin
-        # is a compatible node+client pair. Exports the `mesh` interface (hash
-        # 9c5ad8c4) + opt-in `mesh-control` (2be499fb); imports only
-        # theater:simple/message-server-host.request (residual for theater).
-        # The mesh-client component (mesh v0.2.1 release), pinned by content hash.
-        # Node (mesh.wasm) + client are built from the same source, so this one pin
-        # is a compatible node+client pair. Exports the `mesh` interface (hash
-        # 9c5ad8c4) + opt-in `mesh-control` (2be499fb); imports only
-        # theater:simple/message-server-host.request (residual for theater).
-        # colinrozzi/mesh is public, so this fetchurl needs no auth.
+        # is a compatible node+client pair. v0.3.0 = ephemeral membership +
+        # finality-anchored retention (the substrate for the sentinelctl control
+        # loop); the `mesh` interface added `is-ready` (route it first in
+        # handle-send). Exports `mesh` + opt-in `mesh-control` (the control
+        # envelope). Imports only theater:simple/message-server-host.request
+        # (residual for theater). colinrozzi/mesh is public — fetchurl needs no auth.
         meshClientPkg = pkgs.fetchurl {
-          url = "https://github.com/colinrozzi/mesh/releases/download/v0.2.1/mesh_client_pkg.wasm";
-          hash = "sha256-zjlSTyAvWjQyYLe7C4x3h2EWUaD1hKW6lW9FN9FffQA=";
+          url = "https://github.com/colinrozzi/mesh/releases/download/v0.3.0/mesh_client_pkg.wasm";
+          hash = "sha256-W4q2sjCAIRkKQ9rMlR4yZuw8+YKCeiKK7RrrKFdH9pM=";
         };
 
         # crane cargo-builds both members into bare wasms. crashing_child is a
@@ -130,9 +127,11 @@
 
         # Compose manifest with absolute store paths (packr resolves component
         # paths relative to the manifest dir, but absolute store paths are
-        # absolute). Links the 3 mesh functions sentinel calls to the mesh-client
-        # exports; the full `mesh` interface (declared in sentinel's pack_types) is
-        # hash-checked at compose time, so a drifted mesh-client fails the build.
+        # absolute). Links the mesh + mesh-control functions sentinel calls to the
+        # mesh-client exports (export names are the hyphenated pact names verbatim);
+        # the full `mesh` + `mesh-control` interfaces (declared in sentinel's
+        # pack_types) are hash-checked at compose, so a drifted mesh-client fails
+        # the build. Both interfaces internalize -> the composite is host-only.
         composeManifest = pkgs.writeText "sentinel.compose.toml" ''
           [[component]]
           name = "sentinel"
@@ -160,6 +159,30 @@
           import = "mesh.delivery"
           provider = "mesh-client"
           export = "delivery"
+
+          [[link]]
+          consumer = "sentinel"
+          import = "mesh.is-ready"
+          provider = "mesh-client"
+          export = "is-ready"
+
+          [[link]]
+          consumer = "sentinel"
+          import = "mesh-control.control-kind"
+          provider = "mesh-client"
+          export = "control-kind"
+
+          [[link]]
+          consumer = "sentinel"
+          import = "mesh-control.decode-command"
+          provider = "mesh-client"
+          export = "decode-command"
+
+          [[link]]
+          consumer = "sentinel"
+          import = "mesh-control.encode-response"
+          provider = "mesh-client"
+          export = "encode-response"
         '';
 
       in {

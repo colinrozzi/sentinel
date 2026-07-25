@@ -193,6 +193,10 @@ pub struct SentinelState {
     /// True once we've sent the mesh Register for this node (one-shot, on the
     /// first mesh-arm tick). Idempotent guard so the repeating timer no-ops.
     pub mesh_armed: bool,
+    /// Control-plane allow-list: hex pubkeys permitted to drive control commands
+    /// (from MeshCfg.command_allow). Empty = reject-all (default-deny). Checked
+    /// against each control delivery's authenticated author pubkey.
+    pub command_allow: Vec<String>,
 }
 
 pack_types! {
@@ -219,7 +223,21 @@ pack_types! {
             depart: func(node: string) -> result<list<u8>, string>,
             register: func(node: string, app-id: string) -> result<bool, string>,
             delivery: func(msg: list<u8>) -> option<tuple<list<u8>, list<u8>>>,
+            is-ready: func(msg: list<u8>) -> bool,
             node-config: func(seed: string, listen: string, members: list<string>, dial: list<tuple<string, string>>) -> string,
+        }
+        // mesh-control (opt-in, same mesh-client package) — the app-level control
+        // envelope. Sentinel is the RESPONDER: it RECEIVES Commands and SENDS
+        // Responses, so it binds control-kind + decode-command + encode-response;
+        // the full interface is declared for the hash-checked link.
+        mesh-control {
+            encode-command: func(corr-id: u64, target: list<u8>, cmd: string, args: list<u8>) -> list<u8>,
+            encode-response: func(corr-id: u64, target: list<u8>, result: list<u8>) -> list<u8>,
+            encode-lifecycle: func(event: u8, actor-id: string, ts: u64, data: list<u8>) -> list<u8>,
+            control-kind: func(bytes: list<u8>) -> option<u8>,
+            decode-command: func(bytes: list<u8>) -> option<tuple<u64, list<u8>, string, list<u8>>>,
+            decode-response: func(bytes: list<u8>) -> option<tuple<u64, list<u8>, list<u8>>>,
+            decode-lifecycle: func(bytes: list<u8>) -> option<tuple<u8, string, u64, list<u8>>>,
         }
         theater:simple/timer {
             now: func() -> u64,
@@ -278,6 +296,24 @@ fn mesh_register(node: String, app_id: String) -> Result<bool, String>;
 
 #[import_from("mesh", name = "delivery")]
 fn mesh_delivery(msg: Vec<u8>) -> Option<(Vec<u8>, Vec<u8>)>;
+
+// mesh v0.3 one-shot Ready signal (node admitted + synced). Route this FIRST in
+// handle-send, else fall through to delivery (per mesh CONSUMER.md).
+#[import_from("mesh", name = "is-ready")]
+fn mesh_is_ready(msg: Vec<u8>) -> bool;
+
+// mesh-control bindings — sentinel is the RESPONDER: classify a delivered payload
+// (control-kind), parse a Command (decode-command), and build a Response
+// (encode-response). encode-command / decode-response / decode-lifecycle are the
+// commander's side — declared in the interface for the hash, not bound here.
+#[import_from("mesh-control", name = "control-kind")]
+fn control_kind(bytes: Vec<u8>) -> Option<u8>;
+
+#[import_from("mesh-control", name = "decode-command")]
+fn decode_command(bytes: Vec<u8>) -> Option<(u64, Vec<u8>, String, Vec<u8>)>;
+
+#[import_from("mesh-control", name = "encode-response")]
+fn encode_response(corr_id: u64, target: Vec<u8>, result: Vec<u8>) -> Vec<u8>;
 
 #[import(module = "theater:simple/supervisor", name = "spawn")]
 fn supervisor_spawn(
@@ -398,6 +434,11 @@ struct MeshCfg {
     /// Peers to outbound-dial on init (subset of members). Empty for single-node.
     #[serde(default)]
     dial: Vec<PeerEntry>,
+    /// Control-plane authz: hex pubkeys permitted to drive sentinel over mesh
+    /// control (list/start/stop/...). Empty/absent = reject ALL control commands
+    /// (default-deny). Checked against the delivery's authenticated author pubkey.
+    #[serde(default)]
+    command_allow: Vec<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -545,6 +586,12 @@ fn init(state: Value) -> Result<(SentinelState, ()), String> {
     // the message-server router until spawn returns. The node is INFRASTRUCTURE,
     // not in `children`; a crash of it falls through the unknown-child path (round
     // one does not respawn it).
+    // Control-plane allow-list — pulled out before the match consumes cfg.mesh.
+    let command_allow = cfg
+        .mesh
+        .as_ref()
+        .map(|m| m.command_allow.clone())
+        .unwrap_or_default();
     let mesh_node_id = match cfg.mesh {
         Some(mesh) => {
             // Declaring the message-server handler + exporting handle-send is
@@ -593,6 +640,7 @@ fn init(state: Value) -> Result<(SentinelState, ()), String> {
             children,
             mesh_node_id,
             mesh_armed: false,
+            command_allow,
         },
         (),
     ))
@@ -647,22 +695,84 @@ fn handle_tick(state: SentinelState, name: String) -> Result<(SentinelState, ())
     Ok((state, ()))
 }
 
-/// Mesh delivery callback: the node calls message-server `send(app, bytes)` with
-/// a finalized payload; theater routes it here. Round one just decodes + logs —
-/// this is the PoC success signal. (Round two maps delivered mesh commands onto
-/// sentinel's primitives.) Kept a pure translation per Colin's constraint.
+/// Mesh delivery callback: the node calls message-server `send(app, bytes)`;
+/// theater routes it here. mesh v0.3 routes the one-shot Ready signal FIRST, then
+/// a finalized-payload delivery. Round two: a delivered payload may be a CONTROL
+/// Command — classify it and, if so, run the responder (authorize -> dispatch the
+/// verb into sentinel's existing handlers -> submit a Response). Sentinel stays a
+/// thin translation layer per Colin's constraint: control command in -> existing
+/// primitive -> Response out, no mesh policy here.
 #[export(name = "theater:simple/message-server-client.handle-send")]
 fn handle_send(state: SentinelState, data: Vec<u8>) -> Result<(SentinelState, ()), String> {
     let n = data.len();
+    if mesh_is_ready(data.clone()) {
+        log("[sentinel] mesh: node ready (admitted + synced)".to_string());
+        return Ok((state, ()));
+    }
     match mesh_delivery(data) {
-        Some((from, body)) => log(format!(
-            "[sentinel] mesh RECEIVED from {}: {}",
-            short_hex(&from),
-            String::from_utf8_lossy(&body)
-        )),
+        Some((from, body)) => match control_kind(body.clone()) {
+            Some(1) => handle_control_command(&state, &from, body),
+            _ => log(format!(
+                "[sentinel] mesh RECEIVED from {}: {}",
+                short_hex(&from),
+                String::from_utf8_lossy(&body)
+            )),
+        },
         None => log(format!("[sentinel] mesh: malformed delivery ({} bytes)", n)),
     }
     Ok((state, ()))
+}
+
+/// Decode a control Command, authorize the caller against `command_allow`,
+/// dispatch the verb into sentinel's existing command handlers, and submit the
+/// Response back to the requester (target = the command's authenticated author).
+fn handle_control_command(state: &SentinelState, from: &[u8], body: Vec<u8>) {
+    let (corr_id, _target, cmd, args) = match decode_command(body) {
+        Some(t) => t,
+        None => {
+            log("[sentinel] control: malformed Command".to_string());
+            return;
+        }
+    };
+    // Slice 1 is a single responder; target-filtering (drop target != me) is
+    // deferred — command_allow is the security boundary and the requester filters
+    // the Response by corr_id.
+    let from_hex = hex(from);
+    let authorized = state.command_allow.contains(&from_hex);
+    let result = if authorized {
+        dispatch_control(state, &cmd, &args)
+    } else {
+        log(format!(
+            "[sentinel] control: UNAUTHORIZED cmd '{}' from {}",
+            cmd,
+            short_hex(from)
+        ));
+        error_response("unauthorized")
+    };
+    let resp = encode_response(corr_id, from.to_vec(), result);
+    if !state.mesh_node_id.is_empty() {
+        if let Err(e) = mesh_submit(state.mesh_node_id.clone(), resp) {
+            log(format!("[sentinel] control: response submit failed: {}", e));
+        }
+    }
+    log(format!(
+        "[sentinel] control: cmd '{}' from {} corr_id={} authorized={}",
+        cmd,
+        short_hex(from),
+        corr_id,
+        authorized
+    ));
+}
+
+/// Route a decoded control command into sentinel's EXISTING command handlers —
+/// the same primitives the TCP surface drives. Slice 1: read-only verbs. Write
+/// verbs (start/stop/restart/deploy) parse `args` as JSON and land here next.
+fn dispatch_control(state: &SentinelState, cmd: &str, _args: &[u8]) -> Vec<u8> {
+    match cmd {
+        "list" => cmd_list(state),
+        "health" => cmd_health(state),
+        other => error_response(&format!("unknown control command: {}", other)),
+    }
 }
 
 #[export(name = "theater:simple/supervisor-handlers.handle-child-event")]
