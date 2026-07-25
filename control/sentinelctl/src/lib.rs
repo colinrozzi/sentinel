@@ -62,6 +62,7 @@ pack_types! {
             spawn: func(manifest: string, init-state: option<value>, wasm-bytes: option<list<u8>>) -> result<string, string>,
         }
         theater:simple/timer {
+            now: func() -> u64,
             set-interval: func(name: string, interval-ms: u64) -> result<string, string>,
         }
         theater:simple/message-server-host {
@@ -87,6 +88,8 @@ fn supervisor_spawn(
     init_state: Option<Value>,
     wasm_bytes: Option<Vec<u8>>,
 ) -> Result<String, String>;
+#[import(module = "theater:simple/timer", name = "now")]
+fn timer_now() -> u64;
 #[import(module = "theater:simple/timer", name = "set-interval")]
 fn timer_set_interval(name: String, interval_ms: u64) -> Result<String, String>;
 #[import(module = "theater:simple/message-server-host", name = "register")]
@@ -128,6 +131,10 @@ pub struct CtlState {
     pub args_json: String,
     pub corr_id: u64,
     pub phase: u8,
+    /// Absolute give-up deadline (ms, on the timer.now clock). handle-tick departs
+    /// only once now >= this, so a set-interval build whose FIRST tick fires
+    /// immediately can't depart us at ~0s before the join + round-trip complete.
+    pub deadline_ms: u64,
 }
 
 #[derive(serde::Deserialize)]
@@ -161,6 +168,11 @@ fn default_corr() -> u64 {
 fn default_timeout() -> u64 {
     15000
 }
+/// How often the safety-net timer wakes to re-check the deadline. Decoupled from
+/// timeout_ms: departure decision is the absolute deadline, not the tick itself, so
+/// an immediate first tick is harmless and departure lands within one poll of the
+/// true deadline regardless of the configured timeout.
+const TIMEOUT_POLL_MS: u64 = 2000;
 
 const APP_ID: &str = "sentinel-control";
 
@@ -202,8 +214,13 @@ fn init(state: Value) -> Result<(CtlState, ()), String> {
     .map_err(|e| format!("spawn node: {}", e))?;
     log(format!("[sentinelctl] spawned ephemeral node {}", node_id));
 
-    // Safety net: if we never see is-ready + a response, give up and depart.
-    if let Err(e) = timer_set_interval("timeout".to_string(), cfg.timeout_ms) {
+    // Safety net: if we never see is-ready + a response, give up and depart. We poll
+    // on a short interval and compare timer.now() to an ABSOLUTE deadline, so a theater
+    // build whose set-interval fires its FIRST tick immediately can't depart us at ~0s
+    // before the join even completes (the tick decides nothing; the deadline does).
+    let deadline_ms = timer_now() + cfg.timeout_ms;
+    let poll_ms = cfg.timeout_ms.clamp(1, TIMEOUT_POLL_MS);
+    if let Err(e) = timer_set_interval("timeout".to_string(), poll_ms) {
         log(format!("[sentinelctl] set timeout failed: {}", e));
     }
 
@@ -216,6 +233,7 @@ fn init(state: Value) -> Result<(CtlState, ()), String> {
             args_json: cfg.args_json,
             corr_id: cfg.corr_id,
             phase: 0,
+            deadline_ms,
         },
         (),
     ))
@@ -275,6 +293,11 @@ fn handle_send(state: CtlState, msg: Vec<u8>) -> Result<(CtlState, ()), String> 
 #[export(name = "theater:simple/timer.handle-tick")]
 fn handle_tick(state: CtlState, _timer: String) -> Result<(CtlState, ()), String> {
     if state.phase == 2 {
+        return Ok((state, ()));
+    }
+    // Deadline guard: ignore early/immediate ticks; only give up once the wall clock
+    // has actually passed the deadline, so we never depart before the join had a chance.
+    if timer_now() < state.deadline_ms {
         return Ok((state, ()));
     }
     log(format!(
