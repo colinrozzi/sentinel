@@ -1,5 +1,5 @@
 [workspace]
-members = ["sentinel-actor", "tests/crashing-child"]
+members = ["sentinel-actor", "control/sentinelctl", "tests/crashing-child"]
 resolver = "2"
 
 [profile.release]

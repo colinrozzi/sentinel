@@ -82,7 +82,11 @@ fn log(msg: String);
 #[import(module = "theater:simple/runtime", name = "self")]
 fn runtime_self() -> String;
 #[import(module = "theater:simple/supervisor", name = "spawn")]
-fn supervisor_spawn(manifest: String, init_state: Option<Value>, wasm_bytes: Option<Vec<u8>>) -> Result<String, String>;
+fn supervisor_spawn(
+    manifest: String,
+    init_state: Option<Value>,
+    wasm_bytes: Option<Vec<u8>>,
+) -> Result<String, String>;
 #[import(module = "theater:simple/timer", name = "set-interval")]
 fn timer_set_interval(name: String, interval_ms: u64) -> Result<String, String>;
 #[import(module = "theater:simple/message-server-host", name = "register")]
@@ -90,7 +94,12 @@ fn message_server_register() -> Result<(), String>;
 
 // ---- composed mesh + mesh-control bindings (satisfied by the mesh-client component) ----
 #[import_from("mesh", name = "node-config")]
-fn mesh_node_config(seed: String, listen: String, members: Vec<String>, dial: Vec<(String, String)>) -> String;
+fn mesh_node_config(
+    seed: String,
+    listen: String,
+    members: Vec<String>,
+    dial: Vec<(String, String)>,
+) -> String;
 #[import_from("mesh", name = "register")]
 fn mesh_register(node: String, app_id: String) -> Result<bool, String>;
 #[import_from("mesh", name = "submit")]
@@ -143,23 +152,34 @@ struct CtlConfig {
     #[serde(default = "default_timeout")]
     timeout_ms: u64,
 }
-fn default_cmd() -> String { "list".to_string() }
-fn default_corr() -> u64 { 1 }
-fn default_timeout() -> u64 { 15000 }
+fn default_cmd() -> String {
+    "list".to_string()
+}
+fn default_corr() -> u64 {
+    1
+}
+fn default_timeout() -> u64 {
+    15000
+}
 
 const APP_ID: &str = "sentinel-control";
 
 #[export(name = "theater:simple/actor.init")]
 fn init(state: Value) -> Result<(CtlState, ()), String> {
     let cfg: CtlConfig = match state {
-        Value::String(s) if !s.is_empty() => serde_json::from_str(&s).map_err(|e| format!("parse config: {}", e))?,
+        Value::String(s) if !s.is_empty() => {
+            serde_json::from_str(&s).map_err(|e| format!("parse config: {}", e))?
+        }
         _ => return Err("sentinelctl: missing config".to_string()),
     };
     log("[sentinelctl] init".to_string());
 
     let my_id = runtime_self();
     if let Err(e) = message_server_register() {
-        log(format!("[sentinelctl] message-server register failed: {}", e));
+        log(format!(
+            "[sentinelctl] message-server register failed: {}",
+            e
+        ));
     }
 
     // Build the ephemeral node's InitConfig: our stable manager identity dialing
@@ -174,8 +194,12 @@ fn init(state: Value) -> Result<(CtlState, ()), String> {
         alloc::vec![cfg.sentinel_pubkey.clone()],
         alloc::vec![(cfg.sentinel_pubkey.clone(), cfg.sentinel_addr.clone())],
     );
-    let node_id = supervisor_spawn(cfg.node_manifest.clone(), Some(Value::String(node_init)), None)
-        .map_err(|e| format!("spawn node: {}", e))?;
+    let node_id = supervisor_spawn(
+        cfg.node_manifest.clone(),
+        Some(Value::String(node_init)),
+        None,
+    )
+    .map_err(|e| format!("spawn node: {}", e))?;
     log(format!("[sentinelctl] spawned ephemeral node {}", node_id));
 
     // Safety net: if we never see is-ready + a response, give up and depart.
@@ -219,7 +243,10 @@ fn handle_send(state: CtlState, msg: Vec<u8>) -> Result<(CtlState, ()), String> 
             state.args_json.clone().into_bytes(),
         );
         match mesh_submit(state.node_id.clone(), payload) {
-            Ok(_) => log(format!("[sentinelctl] submitted cmd={} corr={}", state.cmd, state.corr_id)),
+            Ok(_) => log(format!(
+                "[sentinelctl] submitted cmd={} corr={}",
+                state.cmd, state.corr_id
+            )),
             Err(e) => log(format!("[sentinelctl] submit failed: {}", e)),
         }
         return Ok((CtlState { phase: 1, ..state }, ()));
@@ -230,7 +257,11 @@ fn handle_send(state: CtlState, msg: Vec<u8>) -> Result<(CtlState, ()), String> 
             if let Some((corr, _tgt, result)) = ctl_decode_response(body) {
                 if corr == state.corr_id {
                     // The result IS what sentinel's TCP `list` returns.
-                    log(format!("[sentinelctl] RESULT corr={} {}", corr, String::from_utf8_lossy(&result)));
+                    log(format!(
+                        "[sentinelctl] RESULT corr={} {}",
+                        corr,
+                        String::from_utf8_lossy(&result)
+                    ));
                     let _ = mesh_depart(state.node_id.clone());
                     log("[sentinelctl] departed — done".to_string());
                     return Ok((CtlState { phase: 2, ..state }, ()));
@@ -246,13 +277,16 @@ fn handle_tick(state: CtlState, _timer: String) -> Result<(CtlState, ()), String
     if state.phase == 2 {
         return Ok((state, ()));
     }
-    log(format!("[sentinelctl] TIMEOUT (phase={}) — departing", state.phase));
+    log(format!(
+        "[sentinelctl] TIMEOUT (phase={}) — departing",
+        state.phase
+    ));
     let _ = mesh_depart(state.node_id.clone());
     Ok((CtlState { phase: 2, ..state }, ()))
 }
 
 fn hex_to_bytes(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     let mut out = Vec::with_capacity(s.len() / 2);
