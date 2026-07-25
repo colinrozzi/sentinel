@@ -22,9 +22,19 @@
       inputs.rust-overlay.follows = "rust-overlay";
       inputs.crane.follows = "crane";
     };
+
+    # packr CLI (packr compose + packr verify --host-only), pinned to the 0.12.2
+    # tag — the composition-consumer toolchain. Used as a build tool to fuse the
+    # bare sentinel with the mesh-client component into the deployable composite.
+    # 0.12.4: strips internalized interfaces from the composite __pack_types
+    # required-metadata (the load-blocker fix — the composite now declares
+    # host-only so theater stops demanding a phantom mesh handler); also carries
+    # the 0.12.3 flake fixes (doCheck=false + binaryen-wrapped), so no
+    # overrideAttrs / binaryen workarounds are needed.
+    packr.url = "github:colinrozzi/pack/v0.12.4";
   };
 
-  outputs = { self, nixpkgs, flake-utils, rust-overlay, crane, theater }:
+  outputs = { self, nixpkgs, flake-utils, rust-overlay, crane, theater, packr }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         overlays = [ (import rust-overlay) ];
@@ -45,7 +55,7 @@
             (type == "directory");
         };
 
-        # packr 0.11.0 plain-build link flags (composites retired). Just two:
+        # packr 0.11.0+ plain-build link flags (composites retired). Just two:
         # --export-memory (the cdylib exports its own growable memory; packr-guest's
         # setup_guest!() links dlmalloc in) and --no-entry. These MUST reach the real
         # cargo invocation; crane ignores the repo .cargo/config.toml (kept for
@@ -64,8 +74,8 @@
           cargoExtraArgs = "--target wasm32-unknown-unknown";
           CARGO_BUILD_TARGET = "wasm32-unknown-unknown";
           CARGO_ENCODED_RUSTFLAGS = plainBuildRustflags;
-          # Plain build: no compose step, so no theater binary / binaryen needed.
-          # wasm-tools stays for the host-only-imports verify in installPhase.
+          # Plain build: no in-crate compose, so no theater binary / binaryen needed.
+          # wasm-tools stays for the crashing_child host-only verify in installPhase.
           nativeBuildInputs = [ pkgs.wasm-tools ];
           doCheck = false;
         };
@@ -76,29 +86,102 @@
         cargoArtifacts = null;
 
         theaterBin = theater.packages.${system}.default;
+        # packr 0.12.3+ sets doCheck=false in its own flake and wraps the binary
+        # with binaryen on PATH, so the CLI builds in the sealed sandbox and packr
+        # compose finds wasm-merge itself — no overrideAttrs / binaryen workaround.
+        packrCli = packr.packages.${system}.packr;
 
-      in {
-        packages.default = craneLib.buildPackage (commonArgs // {
+        # The mesh-client component (mesh v0.2.0 release), pinned by content hash.
+        # Node (mesh.wasm) + client are built from the same source, so this one pin
+        # is a compatible node+client pair. Exports the `mesh` interface (hash
+        # 9c5ad8c4) + opt-in `mesh-control` (2be499fb); imports only
+        # theater:simple/message-server-host.request (residual for theater).
+        # The mesh-client component (mesh v0.2.1 release), pinned by content hash.
+        # Node (mesh.wasm) + client are built from the same source, so this one pin
+        # is a compatible node+client pair. Exports the `mesh` interface (hash
+        # 9c5ad8c4) + opt-in `mesh-control` (2be499fb); imports only
+        # theater:simple/message-server-host.request (residual for theater).
+        # colinrozzi/mesh is public, so this fetchurl needs no auth.
+        meshClientPkg = pkgs.fetchurl {
+          url = "https://github.com/colinrozzi/mesh/releases/download/v0.2.1/mesh_client_pkg.wasm";
+          hash = "sha256-zjlSTyAvWjQyYLe7C4x3h2EWUaD1hKW6lW9FN9FffQA=";
+        };
+
+        # crane cargo-builds both members into bare wasms. crashing_child is a
+        # plain self-contained actor — asserted host-only here. sentinel is bare
+        # with residual mesh.* imports (satisfied at compose time), so it is NOT
+        # asserted host-only here; that assert runs on the COMPOSITE below.
+        bareBuild = craneLib.buildPackage (commonArgs // {
           inherit cargoArtifacts;
-          # packr 0.11.0 plain build: crane cargo-builds each member into a
-          # directly-loadable <name>.wasm (growable memory + pack:alloc exported,
-          # imports host theater:simple/* only) — no compose step. Install the bare
-          # wasms and verify each imports host-only. crashing_child is the test child.
           installPhaseCommand = ''
             mkdir -p $out
             dir=target/wasm32-unknown-unknown/release
-            for m in sentinel crashing_child; do
-              cp "$dir/$m.wasm" "$out/$m.wasm"
-              bad=$(wasm-tools print "$out/$m.wasm" | grep -E '^[[:space:]]*\(import ' | grep -v 'theater:simple/' || true)
-              if [ -n "$bad" ]; then
-                echo "ERROR: $m.wasm has non-host imports (not self-contained):"
-                echo "$bad"
-                exit 1
-              fi
-              echo "self-contained: $m.wasm"
-            done
+            cp "$dir/crashing_child.wasm" "$out/crashing_child.wasm"
+            bad=$(wasm-tools print "$out/crashing_child.wasm" | grep -E '^[[:space:]]*\(import ' | grep -v 'theater:simple/' || true)
+            if [ -n "$bad" ]; then
+              echo "ERROR: crashing_child.wasm has non-host imports (not self-contained):"
+              echo "$bad"
+              exit 1
+            fi
+            echo "self-contained: crashing_child.wasm"
+            cp "$dir/sentinel.wasm" "$out/sentinel-bare.wasm"
           '';
         });
+
+        # Compose manifest with absolute store paths (packr resolves component
+        # paths relative to the manifest dir, but absolute store paths are
+        # absolute). Links the 3 mesh functions sentinel calls to the mesh-client
+        # exports; the full `mesh` interface (declared in sentinel's pack_types) is
+        # hash-checked at compose time, so a drifted mesh-client fails the build.
+        composeManifest = pkgs.writeText "sentinel.compose.toml" ''
+          [[component]]
+          name = "sentinel"
+          wasm = "${bareBuild}/sentinel-bare.wasm"
+          entry = true
+
+          [[component]]
+          name = "mesh-client"
+          wasm = "${meshClientPkg}"
+
+          [[link]]
+          consumer = "sentinel"
+          import = "mesh.submit"
+          provider = "mesh-client"
+          export = "submit"
+
+          [[link]]
+          consumer = "sentinel"
+          import = "mesh.register"
+          provider = "mesh-client"
+          export = "register"
+
+          [[link]]
+          consumer = "sentinel"
+          import = "mesh.delivery"
+          provider = "mesh-client"
+          export = "delivery"
+        '';
+
+      in {
+        # The deployable artifact = sentinel COMPOSED with the mesh-client
+        # component. packr compose fuses the two isolated components (multi-memory)
+        # + runs the hash-check; packr verify --host-only then asserts the composite
+        # imports host theater:simple/* only (mesh.* internalized;
+        # message-server-host.request residual). crashing_child rides along as the
+        # bare e2e test child.
+        packages.default = pkgs.runCommand "sentinel-composed"
+          # packrCli (0.12.4) is wrapped with binaryen on its PATH, so packr
+          # compose finds wasm-merge itself — no separate binaryen input needed.
+          { nativeBuildInputs = [ packrCli ]; } ''
+            mkdir -p $out
+            packr compose ${composeManifest} -o $out/sentinel.wasm
+            packr verify --host-only $out/sentinel.wasm
+            cp ${bareBuild}/crashing_child.wasm $out/crashing_child.wasm
+            echo "composed + host-only verified: sentinel.wasm ($(stat -c%s $out/sentinel.wasm) bytes)"
+          '';
+
+        # The bare (pre-compose) build, exposed for debugging / the runtime e2e.
+        packages.bare = bareBuild;
 
         packages.theater = theaterBin;
 
@@ -114,11 +197,12 @@
         };
 
         devShells.default = craneLib.devShell {
-          packages = [ rustToolchain theaterBin pkgs.wasm-tools pkgs.ripgrep ];
+          packages = [ rustToolchain theaterBin packrCli pkgs.wasm-tools pkgs.ripgrep ];
           shellHook = ''
-            echo "sentinel dev environment (packr 0.11.0 plain build)"
+            echo "sentinel dev environment (packr 0.12.x — composed with mesh-client)"
             echo "  cargo build --release --target wasm32-unknown-unknown"
-            echo "  # the bare target/.../sentinel.wasm is directly loadable — no compose"
+            echo "  packr compose deploy/sentinel.compose.toml -o sentinel_composed.wasm"
+            echo "  packr verify --host-only sentinel_composed.wasm"
             echo "  theater start sentinel-actor/manifest.toml"
           '';
         };

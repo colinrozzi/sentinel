@@ -51,7 +51,7 @@ use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use packr_guest::{export, import, pack_types, GraphValue, Value};
+use packr_guest::{export, import, import_from, pack_types, GraphValue, Value};
 use serde::{Deserialize, Serialize};
 
 packr_guest::setup_guest!();
@@ -105,84 +105,31 @@ const CHILD_MANIFEST_LABEL_PREFIX: &str = "child-manifest-";
 const BEARER_TOKEN_LABEL: &str = "bearer-token";
 
 // ============================================================================
-// Mesh wire codec (vendored from mesh/mesh-api/src/lib.rs)
+// Hex log helpers
 // ============================================================================
 //
-// The app<->node control envelope carried over theater's message-server. This
-// is a byte-for-byte copy of the four functions sentinel needs; mesh-api is the
-// source of truth. Vendored (not a dep) because sentinel builds via nix+crane
-// whose cleanSource is sentinel's dir only, so a cross-repo path dep won't
-// build. theater-dev endorsed vendoring for round one and will publish mesh-api
-// as a crate before round two touches the wire format. Keep in sync if the mesh
-// command/ack/delivery encoding ever changes.
-mod mesh {
-    use alloc::string::{String, ToString};
-    use alloc::vec::Vec;
+// The mesh submit/register/ack/delivery codec that used to live here (a vendored
+// copy of mesh-api) is gone — sentinel now composes the mesh-client package via
+// `packr compose` and calls the `mesh` interface directly. These two hex helpers
+// are all that remain: pure formatting for log lines + the event-hash returned to
+// a TCP client.
 
-    /// A 32-byte event hash (Submit ack) or ed25519 pubkey (delivery author).
-    pub type Bytes32 = [u8; 32];
-
-    const CMD_SUBMIT: u8 = 0x01; // body = payload bytes
-    const CMD_REGISTER: u8 = 0x04; // body = app actor-id (utf8) for delivery
-
-    /// `0x01 || payload` — ask the node to author + submit a payload.
-    pub fn encode_submit(payload: &[u8]) -> Vec<u8> {
-        let mut v = Vec::with_capacity(1 + payload.len());
-        v.push(CMD_SUBMIT);
-        v.extend_from_slice(payload);
-        v
+/// Short hex of the first 6 bytes, for log lines.
+fn short_hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(12);
+    for &b in bytes.iter().take(6) {
+        s.push_str(&format!("{:02x}", b));
     }
+    s
+}
 
-    /// `0x04 || utf8(app_id)` — tell the node which app-id to deliver to. The
-    /// node's delivery target starts EMPTY, so this MUST precede any Submit or
-    /// handle-send never fires.
-    pub fn encode_register(app_id: &str) -> Vec<u8> {
-        let mut v = Vec::with_capacity(1 + app_id.len());
-        v.push(CMD_REGISTER);
-        v.extend_from_slice(app_id.as_bytes());
-        v
+/// Full lowercase hex of all bytes (for returning an event hash to a client).
+fn hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        s.push_str(&format!("{:02x}", b));
     }
-
-    /// Decode a request ack: `1 || hash[32]` on success, `0 || utf8` on error.
-    pub fn decode_ack(bytes: &[u8]) -> Result<Bytes32, String> {
-        match bytes.split_first() {
-            Some((1, h)) if h.len() == 32 => {
-                let mut hash = [0u8; 32];
-                hash.copy_from_slice(h);
-                Ok(hash)
-            }
-            Some((0, e)) => Err(String::from_utf8_lossy(e).to_string()),
-            _ => Err("malformed ack".to_string()),
-        }
-    }
-
-    /// Decode a delivery (node -> app via send): `from[32] || body`.
-    pub fn decode_delivery(bytes: &[u8]) -> Option<(Bytes32, Vec<u8>)> {
-        if bytes.len() < 32 {
-            return None;
-        }
-        let mut from = [0u8; 32];
-        from.copy_from_slice(&bytes[..32]);
-        Some((from, bytes[32..].to_vec()))
-    }
-
-    /// Short hex of the first 6 bytes, for log lines.
-    pub fn short_hex(bytes: &[u8]) -> String {
-        let mut s = String::with_capacity(12);
-        for &b in bytes.iter().take(6) {
-            s.push_str(&alloc::format!("{:02x}", b));
-        }
-        s
-    }
-
-    /// Full lowercase hex of all bytes (for returning an event hash to a client).
-    pub fn hex(bytes: &[u8]) -> String {
-        let mut s = String::with_capacity(bytes.len() * 2);
-        for &b in bytes {
-            s.push_str(&alloc::format!("{:02x}", b));
-        }
-        s
-    }
+    s
 }
 
 // ============================================================================
@@ -261,7 +208,18 @@ pack_types! {
         }
         theater:simple/message-server-host {
             register: func() -> result<_, string>,
-            request: func(actor-id: string, msg: list<u8>) -> result<list<u8>, string>,
+        }
+        // The mesh client component's interface — satisfied at `packr compose`
+        // time by the mesh-client package (hash-checked link), NOT by the host.
+        // The interface hash covers EVERY binding, so we declare the complete
+        // interface even though only submit/register/delivery are bound below.
+        mesh {
+            submit: func(node: string, payload: list<u8>) -> result<list<u8>, string>,
+            introduce: func(node: string, member: list<u8>) -> result<list<u8>, string>,
+            depart: func(node: string) -> result<list<u8>, string>,
+            register: func(node: string, app-id: string) -> result<bool, string>,
+            delivery: func(msg: list<u8>) -> option<tuple<list<u8>, list<u8>>>,
+            node-config: func(seed: string, listen: string, members: list<string>, dial: list<tuple<string, string>>) -> string,
         }
         theater:simple/timer {
             now: func() -> u64,
@@ -306,8 +264,20 @@ fn runtime_self() -> String;
 #[import(module = "theater:simple/message-server-host", name = "register")]
 fn message_server_register() -> Result<(), String>;
 
-#[import(module = "theater:simple/message-server-host", name = "request")]
-fn message_server_request(actor_id: String, msg: Vec<u8>) -> Result<Vec<u8>, String>;
+// ---- mesh client component bindings (satisfied by the composed mesh-client
+// package). The outbound message-server request to the node lives INSIDE the
+// mesh-client component now, so sentinel no longer imports message-server-host
+// `request` — it calls these interface functions instead. As of packr 0.12.1
+// #[import_from] decodes returns via FromValue, so Result/Option come back
+// directly (the earlier TryFrom<Value> newtype shims are gone).
+#[import_from("mesh", name = "submit")]
+fn mesh_submit(node: String, payload: Vec<u8>) -> Result<Vec<u8>, String>;
+
+#[import_from("mesh", name = "register")]
+fn mesh_register(node: String, app_id: String) -> Result<bool, String>;
+
+#[import_from("mesh", name = "delivery")]
+fn mesh_delivery(msg: Vec<u8>) -> Option<(Vec<u8>, Vec<u8>)>;
 
 #[import(module = "theater:simple/supervisor", name = "spawn")]
 fn supervisor_spawn(
@@ -663,19 +633,15 @@ fn handle_tick(state: SentinelState, name: String) -> Result<(SentinelState, ())
         // to us. MUST land before any Submit or handle-send never fires. The
         // node is reachable now (we're past init). Idempotent via `mesh_armed`.
         let my_id = runtime_self();
-        let cmd = mesh::encode_register(&my_id);
-        match message_server_request(state.mesh_node_id.clone(), cmd) {
-            Ok(reply) => match mesh::decode_ack(&reply) {
-                Ok(_) => {
-                    log(format!(
-                        "[sentinel] mesh: registered app-id {} for delivery",
-                        my_id
-                    ));
-                    state.mesh_armed = true;
-                }
-                Err(e) => log(format!("[sentinel] mesh: register rejected: {}", e)),
-            },
-            Err(e) => log(format!("[sentinel] mesh: register request failed: {}", e)),
+        match mesh_register(state.mesh_node_id.clone(), my_id.clone()) {
+            Ok(_) => {
+                log(format!(
+                    "[sentinel] mesh: registered app-id {} for delivery",
+                    my_id
+                ));
+                state.mesh_armed = true;
+            }
+            Err(e) => log(format!("[sentinel] mesh: register rejected: {}", e)),
         }
     }
     Ok((state, ()))
@@ -687,16 +653,14 @@ fn handle_tick(state: SentinelState, name: String) -> Result<(SentinelState, ())
 /// sentinel's primitives.) Kept a pure translation per Colin's constraint.
 #[export(name = "theater:simple/message-server-client.handle-send")]
 fn handle_send(state: SentinelState, data: Vec<u8>) -> Result<(SentinelState, ()), String> {
-    match mesh::decode_delivery(&data) {
+    let n = data.len();
+    match mesh_delivery(data) {
         Some((from, body)) => log(format!(
             "[sentinel] mesh RECEIVED from {}: {}",
-            mesh::short_hex(&from),
+            short_hex(&from),
             String::from_utf8_lossy(&body)
         )),
-        None => log(format!(
-            "[sentinel] mesh: malformed delivery ({} bytes)",
-            data.len()
-        )),
+        None => log(format!("[sentinel] mesh: malformed delivery ({} bytes)", n)),
     }
     Ok((state, ()))
 }
@@ -1081,25 +1045,24 @@ fn cmd_mesh_submit(state: &SentinelState, payload: Option<String>) -> Vec<u8> {
     if !state.mesh_armed {
         return error_response("mesh not armed yet (Register pending) — retry shortly");
     }
-    let cmd = mesh::encode_submit(payload.unwrap_or_default().as_bytes());
-    match message_server_request(state.mesh_node_id.clone(), cmd) {
-        Ok(reply) => match mesh::decode_ack(&reply) {
-            Ok(hash) => {
-                let hex = mesh::hex(&hash);
-                match serde_json::to_vec(&MeshSubmitResp {
-                    ok: true,
-                    hash: &hex,
-                }) {
-                    Ok(mut v) => {
-                        v.push(b'\n');
-                        v
-                    }
-                    Err(e) => error_response(&format!("encode mesh resp: {}", e)),
+    match mesh_submit(
+        state.mesh_node_id.clone(),
+        payload.unwrap_or_default().into_bytes(),
+    ) {
+        Ok(hash) => {
+            let hash_hex = hex(&hash);
+            match serde_json::to_vec(&MeshSubmitResp {
+                ok: true,
+                hash: &hash_hex,
+            }) {
+                Ok(mut v) => {
+                    v.push(b'\n');
+                    v
                 }
+                Err(e) => error_response(&format!("encode mesh resp: {}", e)),
             }
-            Err(e) => error_response(&format!("mesh submit rejected: {}", e)),
-        },
-        Err(e) => error_response(&format!("mesh request failed: {}", e)),
+        }
+        Err(e) => error_response(&format!("mesh submit rejected: {}", e)),
     }
 }
 
