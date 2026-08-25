@@ -1,0 +1,21 @@
+[package]
+name = "sentinel-system"
+version = "0.1.0"
+edition = "2021"
+description = "The sentinel-side RSM system entry (DESIGN-dx.md): sentinel-the-supervisor gaining a mesh face. Owns all host I/O (tcp gossip / timer / supervisor / store), drives the composed pure `node` core (node.pact), authors the control-plane genesis, and REACTS to finalized commands by running the real supervisor op (list/start/stop/get_chain) + authoring the response. Composed as `sentinel-system ⊕ mesh core ⊕ control-sm`."
+
+# Standalone component — built via nix/packr, composed into the node; not a member
+# of the repo's sentinel-actor workspace.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+packr-guest = { version = "0.20", features = ["derive"] }
+serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+
+[profile.release]
+opt-level = "s"
+lto = true

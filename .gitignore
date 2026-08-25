@@ -3,3 +3,6 @@
 /.direnv
 /.store
 *.swp
+
+# RSM control-plane crate build outputs
+control/**/target/

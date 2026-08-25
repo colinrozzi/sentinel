@@ -1,0 +1,95 @@
+# Client-side control participant: generic mesh-system (entry) ⊕ mesh core ⊕ control-sm.
+# A managing actor runs this to join a sentinel's control mesh as a member and drive it
+# (author commands over the generic mesh-system RPC surface, read the finalized responses).
+# Same control-sm rules as the sentinel side; only the SYSTEM differs (generic vs the
+# sentinel's effectful one). Compose with packr 0.20.
+#
+# Dev component paths (mesh-system + core built from the mesh clone; control-sm from this
+# repo). The eventual client library wraps encode-command / decode-response / corr_id-match.
+
+[[component]]
+name  = "mesh-system"
+wasm  = "/tmp/claude-0/-work/f6282999-4667-469c-8235-86dba9c8cccb/scratchpad/mesh/mesh-system/target/wasm32-unknown-unknown/release/mesh_system.wasm"
+entry = true
+
+[[component]]
+name = "mesh"
+wasm = "/tmp/claude-0/-work/f6282999-4667-469c-8235-86dba9c8cccb/scratchpad/mesh/target/wasm32-unknown-unknown/release/mesh.wasm"
+
+[[component]]
+name = "control-sm"
+wasm = "/repo/control/control-sm/target/wasm32-unknown-unknown/release/control_sm.wasm"
+
+# ---- system → node (node.pact) — mesh-system drives all 10 ----
+[[link]]
+consumer = "mesh-system"
+import   = "node.init"
+provider = "mesh"
+export   = "init"
+[[link]]
+consumer = "mesh-system"
+import   = "node.on-connect"
+provider = "mesh"
+export   = "on-connect"
+[[link]]
+consumer = "mesh-system"
+import   = "node.on-bytes"
+provider = "mesh"
+export   = "on-bytes"
+[[link]]
+consumer = "mesh-system"
+import   = "node.on-close"
+provider = "mesh"
+export   = "on-close"
+[[link]]
+consumer = "mesh-system"
+import   = "node.tick"
+provider = "mesh"
+export   = "tick"
+[[link]]
+consumer = "mesh-system"
+import   = "node.author"
+provider = "mesh"
+export   = "author"
+[[link]]
+consumer = "mesh-system"
+import   = "node.subscribe"
+provider = "mesh"
+export   = "subscribe"
+[[link]]
+consumer = "mesh-system"
+import   = "node.current-state"
+provider = "mesh"
+export   = "current-state"
+[[link]]
+consumer = "mesh-system"
+import   = "node.current-members"
+provider = "mesh"
+export   = "current-members"
+[[link]]
+consumer = "mesh-system"
+import   = "node.event-status"
+provider = "mesh"
+export   = "event-status"
+
+# ---- node → SM (state-machine / Interface 1) ----
+[[link]]
+consumer = "mesh"
+import   = "state-machine.initial-state"
+provider = "control-sm"
+export   = "initial-state"
+[[link]]
+consumer = "mesh"
+import   = "state-machine.validate"
+provider = "control-sm"
+export   = "validate"
+[[link]]
+consumer = "mesh"
+import   = "state-machine.apply"
+provider = "control-sm"
+export   = "apply"
+[[link]]
+consumer = "mesh"
+import   = "state-machine.members"
+provider = "control-sm"
+export   = "members"

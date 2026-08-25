@@ -1,0 +1,21 @@
+[package]
+name = "control-sm"
+version = "0.1.0"
+edition = "2021"
+description = "The sentinel control-plane state machine (RSM Interface 1, DESIGN-dx.md): membership + command_allow authz + a (author, corr_id) command/response journal. Pure, confluent, structure-blind; admission-final under the no-kick invariant. Shared by both sides of the control plane — every member folds it. Rules mirror the proven mesh tests/networks/control SM, authored fresh here (packr 0.20)."
+
+# Standalone component (built independently via nix/packr, composed into the node) —
+# not a member of the repo's sentinel-actor workspace.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+packr-guest = "0.20"
+serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+
+[profile.release]
+opt-level = "s"
+lto = true

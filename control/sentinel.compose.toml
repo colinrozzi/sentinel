@@ -1,0 +1,93 @@
+# Sentinel-side control composite: sentinel-system (entry) ⊕ mesh core ⊕ control-sm.
+#   system → node : node.pact  (the entry owns host I/O, drives the pure core)
+#   node   → SM   : state-machine / Interface 1  (the fold hot path)
+# Compose with packr 0.20:  packr compose control/sentinel.compose.toml --output <out>.wasm
+#
+# Component wasm paths below are the dev build outputs (mesh core built from the mesh
+# clone so its node.pact interface hash matches sentinel-system's declared imports).
+# The eventual nix flake wires these reproducibly (mesh core from the mesh release).
+
+[[component]]
+name  = "sentinel-system"
+wasm  = "/repo/control/sentinel-system/target/wasm32-unknown-unknown/release/sentinel_system.wasm"
+entry = true
+
+[[component]]
+name = "mesh"
+wasm = "/tmp/claude-0/-work/f6282999-4667-469c-8235-86dba9c8cccb/scratchpad/mesh/target/wasm32-unknown-unknown/release/mesh.wasm"
+
+[[component]]
+name = "control-sm"
+wasm = "/repo/control/control-sm/target/wasm32-unknown-unknown/release/control_sm.wasm"
+
+# ---- system → node (node.pact) ----
+[[link]]
+consumer = "sentinel-system"
+import   = "node.init"
+provider = "mesh"
+export   = "init"
+
+[[link]]
+consumer = "sentinel-system"
+import   = "node.on-connect"
+provider = "mesh"
+export   = "on-connect"
+
+[[link]]
+consumer = "sentinel-system"
+import   = "node.on-bytes"
+provider = "mesh"
+export   = "on-bytes"
+
+[[link]]
+consumer = "sentinel-system"
+import   = "node.on-close"
+provider = "mesh"
+export   = "on-close"
+
+[[link]]
+consumer = "sentinel-system"
+import   = "node.tick"
+provider = "mesh"
+export   = "tick"
+
+[[link]]
+consumer = "sentinel-system"
+import   = "node.author"
+provider = "mesh"
+export   = "author"
+
+[[link]]
+consumer = "sentinel-system"
+import   = "node.current-state"
+provider = "mesh"
+export   = "current-state"
+
+# node.subscribe / current-members / event-status are declared in sentinel-system's
+# pact (for the interface hash) but not imported/called, so they have no wasm import
+# to wire — the mesh core still exports them; the sentinel side just doesn't drive them.
+
+# ---- node → SM (state-machine / Interface 1) ----
+[[link]]
+consumer = "mesh"
+import   = "state-machine.initial-state"
+provider = "control-sm"
+export   = "initial-state"
+
+[[link]]
+consumer = "mesh"
+import   = "state-machine.validate"
+provider = "control-sm"
+export   = "validate"
+
+[[link]]
+consumer = "mesh"
+import   = "state-machine.apply"
+provider = "control-sm"
+export   = "apply"
+
+[[link]]
+consumer = "mesh"
+import   = "state-machine.members"
+provider = "control-sm"
+export   = "members"
