@@ -1,9 +1,14 @@
 # Mesh-node supervision spec (sentinel)
 
-Status: DRAFT v2 (2026-08-18). **RE-SCOPED per Colin's call (mail id=486):**
-silent-wedge handling moves from EXTERNAL probing (sentinel polls a node health
-signal) to INTERNAL fail-loud (each node self-watchdogs and panics on no-progress).
-Sentinel stays crash-only. Executes with the chat prod stand-up.
+Status: DRAFT v3 (2026-08-25). v2 re-scoped silent-wedge handling to INTERNAL
+fail-loud (nodes self-watchdog + panic). **v3 REINSTATES the external probe for a
+third class the incident of 2026-08-25 exposed:** a HOST wedge (a theater/tokio
+busy-loop or lock contention — the node accepts TCP but every call hangs, CPU pegged)
+is **epoch-immune** (epoch interrupts a guest wasm call, not a host busy-loop) AND
+**defeats the in-node fail-loud watchdog** (if the host runtime is wedged, the guest
+tick never runs to self-crash). Only an OUT-OF-PROCESS observer catches it — sentinel.
+So the two approaches are complementary, not either/or: fail-loud-in-node covers guest
+stalls; the external sentinel probe covers host wedges. See "Failure classes" below.
 
 ## Goal
 
@@ -65,9 +70,38 @@ from peers -> detection, not state recovery, is the job.
    a mesh node — a tighter K means faster restart). **The K value is mesh-dev's call;
    supervisor-side preference: tighter, so a lost replica recovers in ~30-60s not 5min.**
 
-Sentinel does not distinguish any of these — all three arrive as
-`handle-child-error`/`handle-child-exit` and take the existing crash-path. Nothing
-new on the supervisor side.
+4. **HOST wedge** — the theater/tokio runtime itself busy-loops or lock-contends (the
+   2026-08-25 incident: connection churn drove a host hot-loop). The node **accepts TCP
+   but every call hangs; CPU is pegged.** This is caught by **neither** #2 (the guest
+   tick never runs — the host that would dispatch it is wedged) **nor** #3 (epoch
+   interrupts a guest *call*, not a host busy-loop — it is epoch-immune). No `crash`/
+   `exit` ever fires; the process looks alive. **Only an out-of-process observer catches
+   it -> this is sentinel's external probe** (v3, reinstated).
+
+Classes 1-3 arrive as `handle-child-error`/`exit` and take the existing crash-path —
+nothing new there. **Class 4 is the net-new supervisor work:** an EXTERNAL probe.
+
+## The external probe (v3 — for the host-wedge class only)
+
+- **Active probe with a deadline.** Each interval, sentinel opens a connection to the
+  supervised node + issues a cheap health request with a tight timeout. *Accepts-TCP-
+  but-the-call-hangs* is the host-wedge signature; a timeout while the listener still
+  accepts = wedged. Must be genuinely external (a separate process) — an in-process
+  check would hang alongside everything else.
+- **Corroborate with a process signal:** CPU pegged at ~100%/core with no frontier
+  advance across probes — sentinel reads the child's `/proc/<pid>` CPU ticks (the exact
+  forensic signal gathered by hand in the incident, now continuous).
+- **On detection:** `stop-child` + respawn (through the per-child rate limiter, so a
+  wedge-restart-loop trips `restart_blocked` like any crash loop) + a LOUD
+  `[sentinel] wedge child=<name> class=host ...` line on the off-box-watched journal.
+- Debounce K consecutive failed probes before declaring wedged (avoid a transient
+  slow-call false positive). This probe is ONLY for class 4; classes 1-3 stay
+  self-reporting (crash/epoch/in-node-panic), so the probe is a backstop, not the
+  primary path.
+
+The blast-radius corollary: one-process-per-node lets sentinel restart *just* the
+wedged node; one-process-hosting-N (the incident shape) means a host wedge takes all N
+and restart is all-or-nothing — argues for per-node processes.
 
 ## Crash-notify (unchanged)
 
